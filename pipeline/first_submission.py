@@ -11,6 +11,7 @@ from datetime import date
 from pathlib import Path
 from typing import Mapping
 import csv
+import os
 
 from events_sessions import (
     Session, input_parts, load_window, read_strict_csv, parse_timestamp_ms,
@@ -155,6 +156,12 @@ def make_campaign_daily(data_dir: str | Path, sessions: list[Session],
 
 def compute_both(data_dir: str | Path):
     identity = build_identity_map(data_dir)
-    sessions, users = compute_events_sessions(data_dir, identity)
+    # SHOPPING_NATIVE_EVENTS=0 disables the compiled backend for debugging.
+    # On the scorer, the Dockerfile installs /app/native_events.
+    if os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1':
+        from native_events_bridge import compute_events_sessions_native
+        sessions, users = compute_events_sessions_native(data_dir, identity)
+    else:
+        sessions, users = compute_events_sessions(data_dir, identity)
     campaigns = make_campaign_daily(data_dir, sessions, identity, load_window(data_dir))
     return users, campaigns
