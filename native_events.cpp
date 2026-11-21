@@ -384,8 +384,14 @@ int main(int argc,char**argv){
   // Intern the canonical person and purchase category once. Events now store
   // 32-byte POD records instead of two separately allocated strings.
   unordered_map<string,uint32_t> person_ids;
+  // Cache canonical numeric IDs by original raw user ID. The keys borrow
+  // stable bytes from the read-only event mmaps, which outlive validation.
+  // Repeated users bypass BOTH identity-map and person-interning lookups.
+  unordered_map<string_view,uint32_t> raw_user_cache;
   vector<string> people;
   unordered_map<string,uint32_t> category_ids;
+  // Purchase product IDs are also repeated; resolve their category only once.
+  unordered_map<string_view,uint32_t> product_category_cache;
   vector<string> category_names;
   auto category_number=[&](const string &name)->uint32_t{
     auto [it,inserted]=category_ids.try_emplace(name,static_cast<uint32_t>(category_names.size()));
@@ -451,19 +457,30 @@ int main(int argc,char**argv){
   profile("event_parse_parallel");
   // Preserve the baseline's single-threaded person/category interning order.
   for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
-    auto id=ids.find(string(p.user));
-    string person_name=id==ids.end()?string(p.user):id->second;
-    auto [person_it, inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
-    if(inserted)people.push_back(std::move(person_name));
+    auto [raw_it,raw_inserted]=raw_user_cache.try_emplace(p.user,0U);
+    if(raw_inserted){
+      auto id=ids.find(string(p.user));
+      string person_name=id==ids.end()?string(p.user):id->second;
+      auto [person_it,inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
+      if(inserted)people.push_back(std::move(person_name));
+      raw_it->second=person_it->second;
+    }
     uint32_t cat_id=0;
     if(p.purchase){
-      auto cat_it=categories.find(string(p.product));
-      static const string unknown="unknown";
-      cat_id=category_number(cat_it==categories.end()?unknown:cat_it->second);
+      auto [cat_cached,cat_inserted]=product_category_cache.try_emplace(p.product,0U);
+      if(cat_inserted){
+        auto cat_it=categories.find(string(p.product));
+        static const string unknown="unknown";
+        cat_cached->second=category_number(cat_it==categories.end()?unknown:cat_it->second);
+      }
+      cat_id=cat_cached->second;
     }
-    events.push_back(Event{p.ts,p.cents,person_it->second,cat_id,p.purchase});
+    events.push_back(Event{p.ts,p.cents,raw_it->second,cat_id,p.purchase});
   }
   vector<vector<ParsedEvent>>().swap(parsed);
+  // Drop borrowed-key caches before the underlying mappings are released.
+  raw_user_cache.clear();raw_user_cache.rehash(0);
+  product_category_cache.clear();product_category_cache.rehash(0);
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
   for(auto &shard:shards){shard.rows.clear();}
