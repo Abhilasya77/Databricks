@@ -1,4 +1,5 @@
-﻿import os
+﻿import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,11 @@ CLI_BIN = REPO_ROOT / ("native_campaign_cli.exe" if os.name == "nt" else "native
 def iso_to_ms(iso_str: str) -> int:
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def write_lf(path: Path, content: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
 
 
 def run_native_cli(data_dir: Path, ws_ms: int, we_ms: int, canon_map: dict, sessions: list):
@@ -59,14 +65,14 @@ class TestNativeCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "clicks").mkdir()
-            (d / "campaigns.csv").write_text("campaign_id,channel\ncamp1,search\n", encoding="utf-8")
-            (d / "clicks" / "part0.csv").write_text(
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncamp1,search\n")
+            write_lf(
+                d / "clicks" / "part0.csv",
                 "click_id,user_id,campaign_id,ts\n"
-                "ck1,u1,camp1,2026-01-01T00:00:00.000Z\n",
-                encoding="utf-8",
+                "ck1,u1,camp1,2026-01-01T00:00:00Z\n",
             )
-            ws = iso_to_ms("2026-01-01T00:00:00.000Z")
-            we = iso_to_ms("2026-01-15T00:00:00.000Z")
+            ws = iso_to_ms("2026-01-01T00:00:00Z")
+            we = iso_to_ms("2026-01-15T00:00:00Z")
             sessions = [
                 ("u1", "2026-01-08", ws + SEVEN_DAYS_MS, 1000, True),
                 ("u1", "2026-01-08", ws + SEVEN_DAYS_MS + 1, 500, False),
@@ -81,18 +87,16 @@ class TestNativeCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "clicks").mkdir()
-            (d / "campaigns.csv").write_text(
-                "campaign_id,channel\ncampA,email\ncampB,social\n", encoding="utf-8"
-            )
-            (d / "clicks" / "part0.csv").write_text(
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncampA,email\ncampB,social\n")
+            write_lf(
+                d / "clicks" / "part0.csv",
                 "click_id,user_id,campaign_id,ts\n"
-                "ck_z,u1,campB,2026-01-02T10:00:00.000Z\n"
-                "ck_a,u1,campA,2026-01-02T10:00:00.000Z\n",
-                encoding="utf-8",
+                "ck_z,u1,campB,2026-01-02T10:00:00Z\n"
+                "ck_a,u1,campA,2026-01-02T10:00:00Z\n",
             )
-            ws = iso_to_ms("2026-01-01T00:00:00.000Z")
-            we = iso_to_ms("2026-01-10T00:00:00.000Z")
-            t_sess = iso_to_ms("2026-01-02T10:05:00.000Z")
+            ws = iso_to_ms("2026-01-01T00:00:00Z")
+            we = iso_to_ms("2026-01-10T00:00:00Z")
+            t_sess = iso_to_ms("2026-01-02T10:05:00Z")
             sessions = [("u1", "2026-01-02", t_sess, 2500, True)]
             rows = run_native_cli(d, ws, we, {}, sessions)
             self.assertEqual(rows, [
@@ -104,16 +108,16 @@ class TestNativeCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "clicks").mkdir()
-            (d / "campaigns.csv").write_text("campaign_id,channel\ncamp1,paid\n", encoding="utf-8")
-            (d / "clicks" / "part0.csv").write_text(
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncamp1,paid\n")
+            write_lf(
+                d / "clicks" / "part0.csv",
                 "click_id,user_id,campaign_id,ts\n"
-                "ck1,device_a,camp1,2026-01-03T08:00:00.000Z\n",
-                encoding="utf-8",
+                "ck1,device_a,camp1,2026-01-03T08:00:00Z\n",
             )
-            ws = iso_to_ms("2026-01-01T00:00:00.000Z")
-            we = iso_to_ms("2026-01-10T00:00:00.000Z")
+            ws = iso_to_ms("2026-01-01T00:00:00Z")
+            we = iso_to_ms("2026-01-10T00:00:00Z")
             canon = {"device_a": "person_1", "device_b": "person_1"}
-            t_sess = iso_to_ms("2026-01-03T09:00:00.000Z")
+            t_sess = iso_to_ms("2026-01-03T09:00:00Z")
             sessions = [("person_1", "2026-01-03", t_sess, 4200, True)]
             rows = run_native_cli(d, ws, we, canon, sessions)
             self.assertEqual(rows, [("camp1", "paid", "2026-01-03", 1, 1, 4200, 1)])
@@ -122,25 +126,50 @@ class TestNativeCampaign(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "clicks").mkdir()
-            (d / "campaigns.csv").write_text(
-                "campaign_id,channel\ncamp1,search\ncamp2,display\n", encoding="utf-8"
-            )
-            (d / "clicks" / "part0.csv").write_text(
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncamp1,search\ncamp2,display\n")
+            write_lf(
+                d / "clicks" / "part0.csv",
                 "click_id,user_id,campaign_id,ts\n"
-                "ck1,u1,camp1,2026-01-01T01:00:00.000Z\n"
-                "ck2,u1,camp1,2026-01-01T02:00:00.000Z\n"
-                "ck3,u1,camp2,2026-01-01T03:00:00.000Z\n",
-                encoding="utf-8",
+                "ck1,u1,camp1,2026-01-01T01:00:00Z\n"
+                "ck2,u1,camp1,2026-01-01T02:00:00Z\n"
+                "ck3,u1,camp2,2026-01-01T03:00:00Z\n",
             )
-            ws = iso_to_ms("2026-01-01T00:00:00.000Z")
-            we = iso_to_ms("2026-01-10T00:00:00.000Z")
-            t_sess = iso_to_ms("2026-01-01T04:00:00.000Z")
+            ws = iso_to_ms("2026-01-01T00:00:00Z")
+            we = iso_to_ms("2026-01-10T00:00:00Z")
+            t_sess = iso_to_ms("2026-01-01T04:00:00Z")
             sessions = [("u1", "2026-01-01", t_sess, 900, False)]
             rows = run_native_cli(d, ws, we, {}, sessions)
             self.assertEqual(rows, [
                 ("camp1", "search", "2026-01-01", 0, 0, 0, 1),
                 ("camp2", "display", "2026-01-01", 1, 0, 900, 1),
             ])
+
+    def test_e20_style_ordering_and_timestamp_validation(self):
+        fx_inp = REPO_ROOT / "fixtures" / "E20" / "input"
+        m = json.loads((fx_inp / "manifest.json").read_text(encoding="utf-8"))
+        ws = iso_to_ms(m["window_start"])
+        we = iso_to_ms(m["window_end"])
+        t_sess = iso_to_ms("2026-10-03T09:10:00Z")
+        rows = run_native_cli(fx_inp, ws, we, {}, [("u1", "2026-10-03", t_sess, 1200, True)])
+        self.assertEqual(rows, [
+            ("c_1", "search", "2026-10-03", 1, 1, 1200, 1),
+            ("c_2", "social", "2026-10-03", 0, 0, 0, 1),
+        ])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "clicks").mkdir()
+            write_lf(d / "campaigns.csv", "campaign_id,channel\nc1,search\n")
+            write_lf(
+                d / "clicks" / "part0.csv",
+                "click_id,user_id,campaign_id,ts\n"
+                "bad1,u1,c1,2026-10-03T08:00:00.500Z\n"
+                "bad2,u1,c1,2026-13-03T08:00:00Z\n"
+                "bad3,u1,c1,2026-10-03T08:00:00\n"
+                "good1,u1,c1,2026-10-03T08:00:00Z\n",
+            )
+            out = run_native_cli(d, ws, we, {}, [("u1", "2026-10-03", t_sess, 500, False)])
+            self.assertEqual(out, [("c1", "search", "2026-10-03", 1, 0, 500, 1)])
 
 
 if __name__ == "__main__":
