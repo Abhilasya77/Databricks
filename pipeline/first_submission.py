@@ -257,10 +257,17 @@ def compute_both(data_dir: str | Path):
 
     with engine_context as native_result:
         if native:
-            sessions, users = native_result
+            sessions, users, campaign_path = native_result
         else:
             sessions, users = compute_events_sessions(data_dir, identity)
         mark('events_and_user_daily')
+
+        if native:
+            import json
+            with campaign_path.open(encoding='utf-8') as f:
+                result = [json.loads(line) for line in f if line.strip()]
+            mark('native_campaign_read')
+            return users, result
 
         start_ms, end_ms = load_window(data_dir)
         campaigns = load_campaigns(str(data_dir / 'campaigns.csv'))

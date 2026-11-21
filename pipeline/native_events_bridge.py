@@ -85,9 +85,10 @@ def native_event_files(data_dir, identity_map, scratch_dir=None):
                     f.write(encoded)
         users_path = folder / 'users.jsonl'
         sessions_path = folder / 'sessions.jsonl'
+        campaigns_path = folder / 'campaigns.jsonl'
         mapped = time.perf_counter()
         subprocess.run([str(binary), str(data_dir), str(ids),
-                        str(users_path), str(sessions_path)], check=True)
+                        str(users_path), str(sessions_path), str(campaigns_path)], check=True)
         native_done = time.perf_counter()
         with users_path.open(encoding='utf-8', newline='\n') as f:
             users = [json.loads(line) for line in f]
@@ -99,4 +100,4 @@ def native_event_files(data_dir, identity_map, scratch_dir=None):
             print(f'PROFILE native_engine_seconds={native_done-mapped:.3f}', file=sys.stderr)
             print(f'PROFILE bridge_users_decode_seconds={user_done-native_done:.3f}', file=sys.stderr)
             print(f'PROFILE bridge_sessions_bytes={sessions_path.stat().st_size}', file=sys.stderr)
-        yield sessions_path, users
+        yield sessions_path, users, campaigns_path

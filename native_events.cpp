@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "native_campaign.hpp"
 using namespace std;
 namespace fs = std::filesystem;
 using i64 = int64_t;
@@ -190,7 +191,7 @@ int main(int argc,char**argv){
     }
     last_profile=now;
   };
-  if(argc!=5){cerr<<"usage: native_events DATA_DIR ID_MAP_BIN USERS_JSONL SESSIONS_JSONL\n";return 2;}
+  if(argc!=5 && argc!=6){cerr<<"usage: native_events DATA_DIR ID_MAP_BIN USERS_JSONL SESSIONS_JSONL [CAMPAIGN_JSONL]\n";return 2;}
   fs::path data=argv[1];unordered_map<string,string> ids;
   read_map(argv[2],ids);
   ifstream mi(data/"manifest.json",ios::binary);
@@ -382,6 +383,8 @@ int main(int argc,char**argv){
   // millions of session objects. Input is ordered by canonical person + time,
   // so days are monotone within a person.
   Session cur;
+  vector<native_campaign::CampaignSession> campaign_sessions;
+  if(argc==6) campaign_sessions.reserve(events.size()/5);
   Daily daily;
   bool have_session=false, have_daily=false;
   i64 prev=0, session_count=0, daily_count=0;
@@ -406,6 +409,7 @@ int main(int argc,char**argv){
       <<",\"events\":"<<cur.events<<",\"revenue_cents\":"<<cur.revenue
       <<",\"has_purchase\":"<<(cur.purchased?"true":"false")<<"}\n";
     ++session_count;
+    if(argc==6) campaign_sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
     if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
       flush_daily();
       daily=Daily{cur.person,cur.day};
@@ -430,6 +434,21 @@ int main(int argc,char**argv){
   flush_session();flush_daily();
   so.close();uo.close();
   profile("sessionize_and_json_output");
+  if(argc==6){
+    auto rows=native_campaign::compute_campaign_daily_native(data.string(),ids,lo,hi,campaign_sessions);
+    ofstream co(argv[5],ios::binary);
+    if(!co)throw runtime_error("campaign output not writable");
+    for(const auto &r:rows)
+      co<<"{\"campaign_id\":"<<json_escape(r.campaign_id)
+        <<",\"channel\":"<<json_escape(r.channel)
+        <<",\"day\":"<<json_escape(r.day)
+        <<",\"sessions\":"<<r.sessions
+        <<",\"purchasing_sessions\":"<<r.purchasing_sessions
+        <<",\"revenue_cents\":"<<r.revenue_cents
+        <<",\"assisted_sessions\":"<<r.assisted_sessions<<"}\n";
+    co.close();
+    profile("campaign_native");
+  }
   cerr<<"native_events: clean="<<events.size()<<" sessions="<<session_count<<" user_days="<<daily_count<<"\n";
   return 0;
  }catch(const exception &e){cerr<<"native_events error: "<<e.what()<<"\n";return 1;}

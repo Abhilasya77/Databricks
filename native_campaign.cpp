@@ -1,4 +1,4 @@
-﻿#include "native_campaign.hpp"
+#include "native_campaign.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -59,14 +59,9 @@ bool parse_strict_csv_line(std::string_view line, size_t expected_cols, std::vec
             bool closed = false;
             while (i < n) {
                 if (line[i] == '"') {
-                    if (i + 1 < n && line[i + 1] == '"') {
-                        field.push_back('"');
-                        i += 2;
-                    } else {
-                        ++i;
-                        closed = true;
-                        break;
-                    }
+                    ++i;
+                    closed = true;
+                    break;
                 } else {
                     field.push_back(line[i++]);
                 }
@@ -175,7 +170,7 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
     if (!parse_2digits(p + 5, month)) return false;
     if (p[7] != '-') return false;
     if (!parse_2digits(p + 8, day)) return false;
-    if (p[10] != 'T' && p[10] != 't' && p[10] != ' ') return false;
+    if (p[10] != 'T') return false;
     if (!parse_2digits(p + 11, hour)) return false;
     if (p[13] != ':') return false;
     if (!parse_2digits(p + 14, minute)) return false;
@@ -187,24 +182,11 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
     if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return false;
 
     size_t idx = 19;
-    int ms = 0;
-    if (idx < n && p[idx] == '.') {
-        ++idx;
-        size_t frac_start = idx;
-        int mult = 100;
-        while (idx < n && p[idx] >= '0' && p[idx] <= '9') {
-            if (mult > 0) {
-                ms += (p[idx] - '0') * mult;
-                mult /= 10;
-            }
-            ++idx;
-        }
-        if (idx == frac_start) return false;
-    }
+    if (idx < n && p[idx] == '.') return false;
 
     int tz_offset_sec = 0;
     if (idx >= n) return false;
-    if (p[idx] == 'Z' || p[idx] == 'z') {
+    if (p[idx] == 'Z') {
         ++idx;
         if (idx != n) return false;
     } else if (p[idx] == '+' || p[idx] == '-') {
@@ -223,7 +205,7 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
 
     int64_t days = days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
     int64_t total_sec = days * 86400LL + hour * 3600LL + minute * 60LL + second - tz_offset_sec;
-    out_ms = total_sec * 1000LL + ms;
+    out_ms = total_sec * 1000LL;
     return true;
 }
 
@@ -246,7 +228,6 @@ std::unordered_map<std::string, std::string> load_campaigns_csv(const std::strin
     if (cid_col < 0 || ch_col < 0) return campaigns;
 
     while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
         parse_csv_line_any(line, cols);
         if (static_cast<int>(cols.size()) > std::max(cid_col, ch_col)) {
@@ -346,8 +327,7 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             if (!std::getline(in, line)) continue;
 
             while (std::getline(in, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.empty()) continue;
+                        if (line.empty()) continue;
                 if (!parse_strict_csv_line(line, 4, fields)) continue;
 
                 const std::string& click_id = fields[0];
@@ -355,8 +335,9 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
                 const std::string& campaign_id = fields[2];
                 const std::string& ts_str = fields[3];
 
-                if (click_id.empty() || user_id.empty()) continue;
+                if (click_id.empty()) continue;
                 if (!seen_click_ids.insert(click_id).second) continue;
+                if (user_id.empty()) continue;
 
                 auto cit = campaign_to_idx.find(campaign_id);
                 if (cit == campaign_to_idx.end() || cit->second == 0) continue;
@@ -525,8 +506,7 @@ int main(int argc, char** argv) {
         std::ifstream in(canon_path);
         std::string line;
         while (std::getline(in, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            size_t tab = line.find('\t');
+                size_t tab = line.find('\t');
             if (tab != std::string::npos) {
                 canon.emplace(line.substr(0, tab), line.substr(tab + 1));
             }
@@ -538,8 +518,7 @@ int main(int argc, char** argv) {
         std::ifstream in(sess_path);
         std::string line;
         while (std::getline(in, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
+                if (line.empty()) continue;
             size_t t1 = line.find('\t');
             size_t t2 = line.find('\t', t1 + 1);
             size_t t3 = line.find('\t', t2 + 1);
