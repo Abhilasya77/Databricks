@@ -3,7 +3,7 @@
 # compiler when the scorer runs the read-only container.
 FROM gcc:12-bookworm AS native_builder
 COPY native_events.cpp /src/native_events.cpp
-RUN g++ -std=c++17 -O3 -DNDEBUG -s /src/native_events.cpp -o /native_events
+RUN g++ -std=c++17 -O3 -DNDEBUG -pthread -s /src/native_events.cpp -o /native_events
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \

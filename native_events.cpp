@@ -13,6 +13,9 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -200,27 +203,117 @@ int main(int argc,char**argv){
   profile("metadata_and_identity");
   // Store one compact raw line per event_id instead of six separate strings.
   // Dedup still precedes validation (including late/invalid timestamps).
-  unordered_map<string,Raw> raw;
+  // Independent byte ranges let many workers read even a single large CSV.
+  // Lines are delimited ONLY by LF; each range owns lines whose first byte
+  // falls inside [begin,end). The first range consumes the CSV header.
+  struct Task { fs::path path; uint64_t begin, end; };
+  constexpr uint64_t CHUNK_BYTES=8ULL*1024*1024;
+  vector<Task> tasks;
+  uint64_t estimated_bytes=0;
   for(const auto &p:parts(data/"events")){
-    ifstream in(p,ios::binary);
-    if(!in)throw runtime_error("can't open "+p.string());
-    string line;getline(in,line);
-    array<string_view,7> fields;
-    while(getline(in,line)){
-      if(!parse_event_views(line,fields)||fields[0].empty())continue;
-      const auto ingest_pos=static_cast<uint32_t>(fields[3].data()-line.data());
-      const auto ingest_len=static_cast<uint32_t>(fields[3].size());
-      auto [it, inserted]=raw.try_emplace(string(fields[0]));
-      if(inserted)it->second=Raw{line,ingest_pos,ingest_len};
-      else {
-        const Raw &previous=it->second;
-        const string_view old_ingest(previous.line.data()+previous.ingest_pos,previous.ingest_len);
-        if(fields[3]<old_ingest)it->second=Raw{line,ingest_pos,ingest_len};
+    const uint64_t len=fs::file_size(p);
+    estimated_bytes+=len;
+    if(!len)continue;
+    for(uint64_t begin=0;begin<len;begin+=CHUNK_BYTES)
+      tasks.push_back(Task{p,begin,min(len,begin+CHUNK_BYTES)});
+  }
+  constexpr size_t SHARD_COUNT=128;
+  struct Shard { mutex lock; unordered_map<string,Raw> rows; };
+  array<Shard,SHARD_COUNT> shards;
+  auto read_task=[&](const Task &task){
+    ifstream in(task.path,ios::binary);
+    if(!in)throw runtime_error("can't open "+task.path.string());
+    string line;
+    if(task.begin==0){
+      // Every input file has one header, even when empty after it.
+      if(!getline(in,line))return;
+      uint64_t offset=line.size()+1;
+      while(offset<task.end && getline(in,line)){
+        const uint64_t length=line.size()+1;
+        array<string_view,7> fields;
+        if(parse_event_views(line,fields)&&!fields[0].empty()){
+          const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
+          const uint32_t il=static_cast<uint32_t>(fields[3].size());
+          Shard &shard=shards[hash<string_view>{}(fields[0])&(SHARD_COUNT-1)];
+          lock_guard<mutex> guard(shard.lock);
+          auto [it,inserted]=shard.rows.try_emplace(string(fields[0]));
+          if(inserted)it->second=Raw{line,ip,il};
+          else {
+            Raw &prev=it->second;
+            if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
+              prev=Raw{line,ip,il};
+          }
+        }
+        offset+=length;
+      }
+    }else{
+      // Seek one byte before the split and discard the remainder of that line.
+      // This also handles splits exactly on a newline without losing a record.
+      in.seekg(static_cast<streamoff>(task.begin-1));
+      if(!getline(in,line))return;
+      uint64_t offset=task.begin-1+line.size()+1;
+      while(offset<task.end && getline(in,line)){
+        const uint64_t length=line.size()+1;
+        array<string_view,7> fields;
+        if(parse_event_views(line,fields)&&!fields[0].empty()){
+          const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
+          const uint32_t il=static_cast<uint32_t>(fields[3].size());
+          Shard &shard=shards[hash<string_view>{}(fields[0])&(SHARD_COUNT-1)];
+          lock_guard<mutex> guard(shard.lock);
+          auto [it,inserted]=shard.rows.try_emplace(string(fields[0]));
+          if(inserted)it->second=Raw{line,ip,il};
+          else {
+            Raw &prev=it->second;
+            if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
+              prev=Raw{line,ip,il};
+          }
+        }
+        offset+=length;
       }
     }
+  };
+  size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
+  if(const char* cpus=getenv("NCPU")){
+    char *stop=nullptr;
+    long requested=strtol(cpus,&stop,10);
+    if(stop!=cpus&&*stop=='\0'&&requested>0)
+      thread_count=min<size_t>(16,static_cast<size_t>(requested));
+  }
+  if(const char* cpus=getenv("SHOPPING_NATIVE_THREADS")){
+    char *stop=nullptr;
+    long requested=strtol(cpus,&stop,10);
+    if(stop!=cpus&&*stop=='\0'&&requested>0)
+      thread_count=min<size_t>(16,static_cast<size_t>(requested));
+  }
+  thread_count=min(thread_count,tasks.size());
+  if(thread_count==1){
+    for(const auto &task:tasks)read_task(task);
+  }else if(thread_count>1){
+    atomic<size_t> next{0};
+    exception_ptr failure;
+    mutex failure_lock;
+    auto worker=[&](){
+      try{
+        for(;;){
+          size_t idx=next.fetch_add(1,memory_order_relaxed);
+          if(idx>=tasks.size())break;
+          read_task(tasks[idx]);
+        }
+      }catch(...){
+        lock_guard<mutex> guard(failure_lock);
+        if(!failure)failure=current_exception();
+      }
+    };
+    vector<thread> workers;
+    workers.reserve(thread_count);
+    for(size_t i=0;i<thread_count;++i)workers.emplace_back(worker);
+    for(auto &worker_thread:workers)worker_thread.join();
+    if(failure)rethrow_exception(failure);
   }
   profile("event_dedup");
-  vector<Event> events;events.reserve(raw.size());
+  size_t n_raw=0;
+  for(const auto &shard:shards)n_raw+=shard.rows.size();
+  vector<Event> events;events.reserve(n_raw);
   // Intern the canonical person and purchase category once. Events now store
   // 32-byte POD records instead of two separately allocated strings.
   unordered_map<string,uint32_t> person_ids;
@@ -233,7 +326,7 @@ int main(int argc,char**argv){
     return it->second;
   };
   array<string_view,7> columns;
-  for(const auto &entry:raw){
+  for(const auto &shard:shards)for(const auto &entry:shard.rows){
     const Raw &r=entry.second;
     // Every stored line was already checked as syntactically valid CSV.
     if(!parse_event_views(r.line,columns))throw runtime_error("internal CSV invariant");
@@ -262,7 +355,8 @@ int main(int argc,char**argv){
     events.push_back(Event{ts,cents,person_it->second,cat_id,purchase});
   }
   profile("event_validate");
-  raw.clear();raw.rehash(0);
+  // Release the dedup payloads before sorting compact events.
+  for(auto &shard:shards){shard.rows.clear();shard.rows.rehash(0);}
   // Assign each person a lexicographic rank so the global sort compares
   // integers, not UTF-8 strings, for every event comparison.
   vector<uint32_t> order(people.size());
