@@ -1,0 +1,38 @@
+Shopping Sessions — FIRST COMPLETE BASELINE
+===========================================
+This is a provisional complete pipeline, not the final optimized team submission.
+It uses your tested pipeline/events_sessions.py and includes provisional
+identity/click/campaign processing. Your teammate's finished code can replace
+first_submission.py after integration.
+
+IN YOUR MAC TERMINAL
+--------------------
+cd ~/Databricks
+git branch --show-current
+# should show integration/first-submission
+unzip -o ~/Downloads/ShoppingSessions_First_Complete_Baseline.zip -d .
+
+# Test the row calculations for both outputs, no Docker needed:
+python3 scripts/check_both_baseline.py
+
+# Native Mac/ARM64 container test first (much faster than AMD64 emulation):
+make run-dev PLATFORM=linux/arm64 CPUS=4 MEM=6g
+make check-dev
+
+# If both table comparisons show MATCH, test all 36 Docker fixtures:
+make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=6g
+
+# For scorer architecture build (may be slow under Apple Silicon emulation):
+make build PLATFORM=linux/amd64
+
+# If BOTH output tables pass on dev + fixtures, push a candidate:
+git add pipeline/pipeline.py pipeline/first_submission.py scripts/check_both_baseline.py
+git commit -m "Add complete correctness-first baseline"
+git push -u origin integration/first-submission
+
+The current pure Python baseline is not optimized for the 60M-event final,
+and likely will be too slow or memory-intensive at full scale.
+DO NOT submit until both tables pass dev, official Docker fixture tests,
+and you have evaluated the 60M scale risk.
+
+Do not commit generated datasets or output folders (dev/, out/, dev-answer/).
