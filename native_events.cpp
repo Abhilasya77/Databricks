@@ -221,6 +221,12 @@ int main(int argc,char**argv){
   constexpr size_t SHARD_COUNT=128;
   struct Shard { mutex lock; unordered_map<string,Raw> rows; };
   array<Shard,SHARD_COUNT> shards;
+  // Pre-size event ID shard buckets to avoid repeated hash-table growth.
+  // Cap initial table size so large hidden data does not oversubscribe RAM.
+  const size_t hint_per_shard = min<size_t>(
+      250000, static_cast<size_t>(estimated_bytes / 150 / SHARD_COUNT));
+  for (auto &shard : shards) shard.rows.reserve(hint_per_shard);
+
   auto read_task=[&](const Task &task){
     ifstream in(task.path,ios::binary);
     if(!in)throw runtime_error("can't open "+task.path.string());
