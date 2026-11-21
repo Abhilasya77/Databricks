@@ -20,6 +20,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <memory>
+#include <cstring>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "native_campaign.hpp"
 using namespace std;
 namespace fs = std::filesystem;
@@ -90,7 +97,7 @@ static bool parse_line(const string &line,size_t fields,vector<string> &out){
 }
 // Zero-allocation parser for event rows. Views remain valid while `line` lives.
 // The challenge dialect has no escaped quotes and no quoted commas.
-static bool parse_event_views(const string &line, array<string_view,7> &out){
+static bool parse_event_views(string_view line, array<string_view,7> &out){
   if(line.empty())return false;
   size_t begin=0;
   for(size_t i=0;i<7;++i){
@@ -172,7 +179,7 @@ static string day_string(i64 ts){
   char str[16];snprintf(str,sizeof(str),"%04d-%02u-%02u",y,m,d);
   return str;
 }
-struct Raw{string line; uint32_t ingest_pos=0, ingest_len=0;};
+struct Raw{string_view line; uint32_t ingest_pos=0, ingest_len=0;};
 struct Event{ i64 ts=0, cents=0; uint32_t person=0, category=0; bool purchase=false;};
 struct Session{
   string person, day; i64 start=0,events=0,revenue=0;
@@ -207,119 +214,129 @@ int main(int argc,char**argv){
   // Independent byte ranges let many workers read even a single large CSV.
   // Lines are delimited ONLY by LF; each range owns lines whose first byte
   // falls inside [begin,end). The first range consumes the CSV header.
-  struct Task { fs::path path; uint64_t begin, end; };
+  // V26: zero-copy mmap reader. Raw lines and dedup IDs point directly into
+  // read-only event files, avoiding ~2 allocations and copies per unique ID.
+  // All mappings stay alive until after the parallel validation + interning
+  // phase, so all borrowed string_views remain valid.
+  struct MappedFile {
+    const char *data=nullptr;
+    size_t size=0;
+    explicit MappedFile(const fs::path &path){
+      int fd=open(path.c_str(), O_RDONLY);
+      if(fd<0)throw runtime_error("cannot open event file: "+path.string());
+      struct stat st{};
+      if(fstat(fd,&st)!=0 || st.st_size<0){close(fd);throw runtime_error("cannot stat event file");}
+      size=static_cast<size_t>(st.st_size);
+      if(static_cast<off_t>(size)!=st.st_size){close(fd);throw runtime_error("event file too big");}
+      if(size){
+        void *p=mmap(nullptr,size,PROT_READ,MAP_PRIVATE,fd,0);
+        if(p==MAP_FAILED){close(fd);throw runtime_error("event mmap failed");}
+        data=static_cast<const char*>(p);
+      }
+      close(fd);
+    }
+    ~MappedFile(){if(data)munmap(const_cast<char*>(data),size);}
+    MappedFile(const MappedFile&)=delete;
+    MappedFile& operator=(const MappedFile&)=delete;
+  };
+  struct Task { const MappedFile *file; uint64_t begin,end; };
   constexpr uint64_t CHUNK_BYTES=8ULL*1024*1024;
+  vector<unique_ptr<MappedFile>> mappings;
   vector<Task> tasks;
   uint64_t estimated_bytes=0;
   for(const auto &p:parts(data/"events")){
-    const uint64_t len=fs::file_size(p);
+    auto f=make_unique<MappedFile>(p);
+    const uint64_t len=f->size;
     estimated_bytes+=len;
-    if(!len)continue;
-    for(uint64_t begin=0;begin<len;begin+=CHUNK_BYTES)
-      tasks.push_back(Task{p,begin,min(len,begin+CHUNK_BYTES)});
+    if(len){
+      for(uint64_t begin=0;begin<len;begin+=CHUNK_BYTES)
+        tasks.push_back(Task{f.get(),begin,min(len,begin+CHUNK_BYTES)});
+    }
+    mappings.push_back(move(f));
   }
   constexpr size_t SHARD_COUNT=128;
-  // V24 experimental: flat open-addressed index, contiguous entries.
-  // Full IDs are always compared, so hash collisions cannot merge events.
   struct FlatRows {
-    struct Entry { string first; Raw second; size_t hash_code; };
+    struct Entry { string_view first; Raw second; size_t hash_code; };
     vector<Entry> entries;
-    vector<uint32_t> slots; // 1-based index, zero means empty
+    vector<uint32_t> slots;
     size_t size() const { return entries.size(); }
-    void rehash_to(size_t capacity) {
-      vector<uint32_t> new_slots(capacity, 0);
-      for(size_t idx=0; idx<entries.size(); ++idx){
-        size_t pos=(entries[idx].hash_code >> 7) & (capacity-1);
-        while(new_slots[pos]) pos=(pos+1)&(capacity-1);
-        new_slots[pos]=static_cast<uint32_t>(idx+1);
+    void rehash_to(size_t capacity){
+      vector<uint32_t> next(capacity,0);
+      for(size_t i=0;i<entries.size();++i){
+        size_t pos=(entries[i].hash_code>>7)&(capacity-1);
+        while(next[pos])pos=(pos+1)&(capacity-1);
+        next[pos]=static_cast<uint32_t>(i+1);
       }
-      slots.swap(new_slots);
+      slots.swap(next);
     }
     void reserve(size_t n){
       entries.reserve(n);
       size_t capacity=16;
-      while(capacity < n*2)capacity*=2;
+      while(capacity<n*2)capacity*=2;
       rehash_to(capacity);
     }
-    pair<Entry*, bool> try_emplace(string_view key,size_t hash_code){
-      if(slots.empty()) rehash_to(16);
-      // Never permit a load factor above 0.70.
-      if((entries.size()+1)*10 >= slots.size()*7)
-        rehash_to(slots.size()*2);
-      size_t pos=(hash_code >> 7)&(slots.size()-1);
+    pair<Entry*,bool> try_emplace(string_view key,size_t hash_code){
+      if(slots.empty())rehash_to(16);
+      if((entries.size()+1)*10>=slots.size()*7)rehash_to(slots.size()*2);
+      size_t pos=(hash_code>>7)&(slots.size()-1);
       while(slots[pos]){
         Entry &e=entries[slots[pos]-1];
         if(e.hash_code==hash_code && e.first==key)return {&e,false};
         pos=(pos+1)&(slots.size()-1);
       }
-      if(entries.size()==UINT32_MAX) throw runtime_error("too many event IDs per shard");
-      entries.push_back(Entry{string(key), Raw{}, hash_code});
+      if(entries.size()==UINT32_MAX)throw runtime_error("too many event IDs per shard");
+      entries.push_back(Entry{key,Raw{},hash_code});
       slots[pos]=static_cast<uint32_t>(entries.size());
       return {&entries.back(),true};
     }
-    auto begin() const {return entries.begin();}
-    auto end() const {return entries.end();}
+    auto begin() const{return entries.begin();}
+    auto end() const{return entries.end();}
     void clear(){entries.clear();slots.clear();}
-    void rehash(int){} // compatibility with existing cleanup loop
   };
   struct Shard { mutex lock; FlatRows rows; };
   array<Shard,SHARD_COUNT> shards;
-  const size_t hint_per_shard = min<size_t>(
-      250000, static_cast<size_t>(estimated_bytes / 150 / SHARD_COUNT));
+  const size_t hint_per_shard=min<size_t>(250000,static_cast<size_t>(estimated_bytes/150/SHARD_COUNT));
   for(auto &shard:shards)shard.rows.reserve(hint_per_shard);
 
   auto read_task=[&](const Task &task){
-    ifstream in(task.path,ios::binary);
-    if(!in)throw runtime_error("can't open "+task.path.string());
-    string line;
-    if(task.begin==0){
-      // Every input file has one header, even when empty after it.
-      if(!getline(in,line))return;
-      uint64_t offset=line.size()+1;
-      while(offset<task.end && getline(in,line)){
-        const uint64_t length=line.size()+1;
-        array<string_view,7> fields;
-        if(parse_event_views(line,fields)&&!fields[0].empty()){
-          const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
-          const uint32_t il=static_cast<uint32_t>(fields[3].size());
-          const size_t idhash=hash<string_view>{}(fields[0]);
-          Shard &shard=shards[idhash&(SHARD_COUNT-1)];
-          lock_guard<mutex> guard(shard.lock);
-          auto [it,inserted]=shard.rows.try_emplace(fields[0], idhash);
-          if(inserted)it->second=Raw{line,ip,il};
-          else {
-            Raw &prev=it->second;
-            if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
-              prev=Raw{line,ip,il};
-          }
-        }
-        offset+=length;
-      }
+    const MappedFile &f=*task.file;
+    const char *const base=f.data;
+    const size_t file_end=f.size;
+    size_t start=static_cast<size_t>(task.begin);
+    if(start==0){
+      // Skip the CSV header, even if the header occupies the whole file.
+      const void *lf=memchr(base,'\n',file_end);
+      if(!lf)return;
+      start=static_cast<const char*>(lf)-base+1;
     }else{
-      // Seek one byte before the split and discard the remainder of that line.
-      // This also handles splits exactly on a newline without losing a record.
-      in.seekg(static_cast<streamoff>(task.begin-1));
-      if(!getline(in,line))return;
-      uint64_t offset=task.begin-1+line.size()+1;
-      while(offset<task.end && getline(in,line)){
-        const uint64_t length=line.size()+1;
-        array<string_view,7> fields;
-        if(parse_event_views(line,fields)&&!fields[0].empty()){
-          const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
-          const uint32_t il=static_cast<uint32_t>(fields[3].size());
-          const size_t idhash=hash<string_view>{}(fields[0]);
-          Shard &shard=shards[idhash&(SHARD_COUNT-1)];
-          lock_guard<mutex> guard(shard.lock);
-          auto [it,inserted]=shard.rows.try_emplace(fields[0], idhash);
-          if(inserted)it->second=Raw{line,ip,il};
-          else {
-            Raw &prev=it->second;
-            if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
-              prev=Raw{line,ip,il};
-          }
-        }
-        offset+=length;
+      // Exactly-on-boundary lines belong to this chunk. Otherwise skip the
+      // fragment that belongs to the preceding chunk.
+      if(base[start-1]!='\n'){
+        const void *lf=memchr(base+start,'\n',file_end-start);
+        if(!lf)return;
+        start=static_cast<const char*>(lf)-base+1;
       }
+    }
+    while(start<task.end && start<file_end){
+      const void *lf=memchr(base+start,'\n',file_end-start);
+      const size_t stop=lf?static_cast<const char*>(lf)-base:file_end;
+      const string_view line(base+start,stop-start);
+      array<string_view,7> fields;
+      if(parse_event_views(line,fields)&&!fields[0].empty()){
+        const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
+        const uint32_t il=static_cast<uint32_t>(fields[3].size());
+        const size_t idhash=hash<string_view>{}(fields[0]);
+        Shard &shard=shards[idhash&(SHARD_COUNT-1)];
+        lock_guard<mutex> guard(shard.lock);
+        auto [it,inserted]=shard.rows.try_emplace(fields[0],idhash);
+        if(inserted)it->second=Raw{line,ip,il};
+        else{
+          Raw &prev=it->second;
+          if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
+            prev=Raw{line,ip,il};
+        }
+      }
+      start=stop+static_cast<size_t>(!!lf);
     }
   };
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
