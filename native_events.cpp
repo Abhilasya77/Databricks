@@ -372,9 +372,24 @@ int main(int argc,char**argv){
   for(auto &e:events)e.person=rank[e.person];
   vector<string>().swap(people);
   unordered_map<string,uint32_t>().swap(person_ids);
-  sort(events.begin(),events.end(),[](const Event&a,const Event&b){
-    return a.person==b.person ? a.ts<b.ts : a.person<b.person;
-  });
+  // Counting-distribute by canonical person (already assigned lexicographic
+  // ranks), then sort timestamps only inside each person's contiguous span.
+  // This avoids millions of cross-person comparisons in the global sort.
+  if(!events.empty()){
+    vector<size_t> ends(sorted_people.size()+1,0);
+    for(const Event &e:events)++ends[static_cast<size_t>(e.person)+1];
+    for(size_t i=1;i<ends.size();++i)ends[i]+=ends[i-1];
+    vector<size_t> write_pos=ends;
+    vector<Event> grouped(events.size());
+    for(const Event &e:events)grouped[write_pos[e.person]++]=e;
+    events.swap(grouped);
+    for(size_t i=0;i<sorted_people.size();++i){
+      const size_t from=ends[i], to=ends[i+1];
+      if(to-from>1)
+        sort(events.begin()+from,events.begin()+to,
+             [](const Event&a,const Event&b){return a.ts<b.ts;});
+    }
+  }
   profile("event_sort");
   ofstream so(argv[4],ios::binary);
   ofstream uo(argv[3],ios::binary);
