@@ -243,34 +243,49 @@ def compute_campaign_daily(
          AND s.session_start_ms >= c.click_ts_ms
         GROUP BY 1, 2
     ),
-    person_campaigns AS (
-        SELECT DISTINCT person_id, campaign_id
+    click_gaps AS (
+        SELECT
+            person_id,
+            campaign_id,
+            click_ts_ms,
+            CASE
+                WHEN click_ts_ms - LAG(click_ts_ms) OVER (
+                    PARTITION BY person_id, campaign_id ORDER BY click_ts_ms
+                ) <= {SEVEN_DAYS_MS}
+                THEN 0 ELSE 1
+            END AS is_new_interval
         FROM _clicks
     ),
-    session_campaigns AS (
+    click_islands AS (
         SELECT
-            s.session_id,
-            s.person_id,
-            s.day,
-            s.session_start_ms,
-            pc.campaign_id
-        FROM {sessions_table} s
-        JOIN person_campaigns pc
-          ON s.person_id = pc.person_id
+            person_id,
+            campaign_id,
+            click_ts_ms,
+            SUM(is_new_interval) OVER (
+                PARTITION BY person_id, campaign_id ORDER BY click_ts_ms
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS island_id
+        FROM click_gaps
+    ),
+    merged_intervals AS (
+        SELECT
+            person_id,
+            campaign_id,
+            MIN(click_ts_ms) AS start_ms,
+            MAX(click_ts_ms) + {SEVEN_DAYS_MS} AS end_ms
+        FROM click_islands
+        GROUP BY person_id, campaign_id, island_id
     ),
     assists AS (
-        -- Check only the latest click per (person_id, campaign_id) via ASOF JOIN
-        -- Eliminates intermediate blowup for users with thousands of clicks
         SELECT
-            sc.campaign_id,
-            sc.day,
+            iv.campaign_id,
+            s.day,
             COUNT(*) AS assisted_sessions
-        FROM session_campaigns sc
-        ASOF JOIN _clicks c
-          ON sc.person_id = c.person_id
-         AND sc.campaign_id = c.campaign_id
-         AND sc.session_start_ms >= c.click_ts_ms
-        WHERE c.click_ts_ms >= sc.session_start_ms - {SEVEN_DAYS_MS}
+        FROM {sessions_table} s
+        JOIN merged_intervals iv
+          ON s.person_id = iv.person_id
+         AND s.session_start_ms >= iv.start_ms
+         AND s.session_start_ms <= iv.end_ms
         GROUP BY 1, 2
     ),
     combined AS (
