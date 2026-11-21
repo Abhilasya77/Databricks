@@ -231,7 +231,7 @@ def _sessions_to_duckdb(con, sessions, scratch: Path):
 def compute_both(data_dir: str | Path):
     """V4: validated native event path + teammate's optimized campaign ASOF SQL."""
     from identity_campaign import (
-        load_links_from_dir, load_campaigns, load_and_clean_clicks,
+        load_links_from_dir, load_campaigns, load_clicks_duckdb,
         compute_campaign_daily,
     )
     import duckdb
@@ -264,9 +264,6 @@ def compute_both(data_dir: str | Path):
 
         start_ms, end_ms = load_window(data_dir)
         campaigns = load_campaigns(str(data_dir / 'campaigns.csv'))
-        cleaned_clicks = load_and_clean_clicks(str(data_dir / 'clicks'), campaigns,
-                                               identity, start_ms, end_ms)
-        mark('clicks_parse_and_dedup')
         scratch = Path(os.environ.get('SCRATCH_DIR') or '/tmp')
         scratch.mkdir(parents=True, exist_ok=True)
         con = duckdb.connect()
@@ -276,10 +273,13 @@ def compute_both(data_dir: str | Path):
         con.execute(f"SET memory_limit = '{max(1,int(mem_gb*0.8))}GB'")
         con.execute(f"SET temp_directory = '{str(scratch / 'duckdb_tmp').replace(chr(39),chr(39)*2)}'")
         con.execute('SET preserve_insertion_order = false')
-        _sessions_to_duckdb(con, sessions, scratch)
-        mark('sessions_duckdb_load')
         try:
-            rel = compute_campaign_daily(con, 'sessions', cleaned_clicks, campaigns)
+            _sessions_to_duckdb(con, sessions, scratch)
+            mark('sessions_duckdb_load')
+            load_clicks_duckdb(con, str(data_dir / 'clicks'), campaigns,
+                               identity, start_ms, end_ms)
+            mark('clicks_duckdb_load')
+            rel = compute_campaign_daily(con, 'sessions', None, campaigns)
             names = ['campaign_id','channel','day','sessions','purchasing_sessions',
                      'revenue_cents','assisted_sessions']
             result = [dict(zip(names, row)) for row in rel.fetchall()]

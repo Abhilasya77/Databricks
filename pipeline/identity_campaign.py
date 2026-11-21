@@ -144,7 +144,7 @@ def load_and_clean_clicks(
 
 def _bulk_load_clicks(
     con: duckdb.DuckDBPyConnection,
-    cleaned_clicks: List[Tuple[str, str, str, int]],
+    cleaned_clicks: Optional[List[Tuple[str, str, str, int]]],
 ) -> None:
     """Bulk-load cleaned clicks into DuckDB via temp CSV + native read_csv (avoids slow executemany)."""
     con.execute("DROP TABLE IF EXISTS _clicks")
@@ -190,6 +190,170 @@ def _bulk_load_clicks(
             os.remove(tmp_path)
 
 
+def load_clicks_duckdb(
+    con: duckdb.DuckDBPyConnection,
+    clicks_dir: str,
+    campaigns: Dict[str, str],
+    canonical_map: Dict[str, str],
+    window_start_ms: int,
+    window_end_ms: int,
+) -> None:
+    """Native multi-threaded DuckDB click ingestion (V6) with strict CSV parity."""
+    import glob as _glob
+    import json as _json
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    con.execute("DROP TABLE IF EXISTS _clicks")
+    con.execute("DROP TABLE IF EXISTS _campaigns")
+    con.execute("CREATE TEMP TABLE _campaigns (campaign_id VARCHAR, channel VARCHAR)")
+    if campaigns:
+        con.executemany("INSERT INTO _campaigns VALUES (?, ?)", list(campaigns.items()))
+
+    files = sorted(_glob.glob(os.path.join(clicks_dir, "*.csv"))) if os.path.isdir(clicks_dir) else []
+    if not files or not campaigns:
+        con.execute("""
+            CREATE TEMP TABLE _clicks (
+                click_id VARCHAR,
+                person_id VARCHAR,
+                campaign_id VARCHAR,
+                click_ts_ms BIGINT
+            )
+        """)
+        return
+
+    con.execute("DROP TABLE IF EXISTS _canonical_map")
+    con.execute("CREATE TEMP TABLE _canonical_map (user_id VARCHAR, person_id VARCHAR)")
+    if canonical_map:
+        scratch = _Path(os.environ.get("SCRATCH_DIR") or _tempfile.gettempdir())
+        scratch.mkdir(parents=True, exist_ok=True)
+        with _tempfile.NamedTemporaryFile(
+            "w", suffix=".ndjson", delete=False, encoding="utf-8", newline="\n", dir=scratch
+        ) as tmp:
+            for u, p in canonical_map.items():
+                tmp.write(_json.dumps({"user_id": u, "person_id": p}, ensure_ascii=False) + "\n")
+            map_path = tmp.name
+        map_path_sql = map_path.replace("\\", "/")
+        try:
+            con.execute(f"""
+                INSERT INTO _canonical_map
+                SELECT user_id, person_id FROM read_json(
+                    '{map_path_sql}',
+                    format='newline_delimited',
+                    columns={{'user_id': 'VARCHAR', 'person_id': 'VARCHAR'}}
+                )
+            """)
+        finally:
+            if os.path.exists(map_path):
+                os.remove(map_path)
+
+    min_ts = window_start_ms - SEVEN_DAYS_MS
+    duck_files = [f.replace("\\", "/") for f in files]
+    files_sql = "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in duck_files) + "]"
+
+    def unquote_expr(col: str) -> str:
+        return (
+            f"CASE "
+            f"WHEN NOT contains({col}, '\"') THEN {col} "
+            f"WHEN length({col}) >= 2 AND starts_with({col}, '\"') AND ends_with({col}, '\"') "
+            f"     AND NOT contains(substr({col}, 2, length({col}) - 2), '\"') "
+            f"THEN substr({col}, 2, length({col}) - 2) "
+            f"ELSE NULL END"
+        )
+
+    con.execute(f"""
+        CREATE TEMP TABLE _clicks AS
+        WITH file_lines AS (
+            SELECT
+                filename,
+                generate_subscripts(lines, 1) AS rn,
+                unnest(lines) AS raw_line
+            FROM (
+                SELECT
+                    filename,
+                    string_split(content, chr(10)) AS lines
+                FROM read_text({files_sql})
+            )
+        ),
+        raw_lines AS (
+            SELECT
+                filename,
+                rn,
+                string_split(raw_line, ',') AS parts
+            FROM file_lines
+            WHERE rn > 1
+              AND raw_line IS NOT NULL
+              AND raw_line != ''
+        ),
+        parsed_fields AS (
+            SELECT
+                filename,
+                rn,
+                {unquote_expr('parts[1]')} AS click_id,
+                {unquote_expr('parts[2]')} AS user_id,
+                {unquote_expr('parts[3]')} AS campaign_id,
+                {unquote_expr('parts[4]')} AS ts_str
+            FROM raw_lines
+            WHERE len(parts) = 4
+        ),
+        valid_ids AS (
+            SELECT filename, rn, click_id, user_id, campaign_id, ts_str
+            FROM parsed_fields
+            WHERE click_id IS NOT NULL AND click_id != ''
+              AND user_id IS NOT NULL AND user_id != ''
+              AND campaign_id IS NOT NULL
+              AND ts_str IS NOT NULL
+        ),
+        deduped AS (
+            SELECT
+                click_id,
+                ARG_MIN(user_id, (filename, rn)) AS user_id,
+                ARG_MIN(campaign_id, (filename, rn)) AS campaign_id,
+                ARG_MIN(ts_str, (filename, rn)) AS ts_str
+            FROM valid_ids
+            GROUP BY click_id
+        ),
+        with_ts AS (
+            SELECT
+                d.click_id,
+                d.user_id,
+                d.campaign_id,
+                CASE
+                    WHEN regexp_matches(d.ts_str, '^[0-9]+$') THEN
+                        CASE
+                            WHEN length(COALESCE(NULLIF(ltrim(d.ts_str, '0'), ''), '0')) <= 18
+                            THEN CAST(COALESCE(NULLIF(ltrim(d.ts_str, '0'), ''), '0') AS BIGINT)
+                            ELSE NULL
+                        END
+                    WHEN length(d.ts_str) = 20
+                     AND regexp_matches(d.ts_str, '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}Z$') THEN
+                        epoch_ms(try_strptime(d.ts_str, '%Y-%m-%dT%H:%M:%SZ'))
+                    WHEN length(d.ts_str) = 25
+                     AND regexp_matches(d.ts_str, '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}[+-][0-9]{{2}}:[0-9]{{2}}$')
+                     AND CAST(substr(d.ts_str, 21, 2) AS INT) <= 23
+                     AND CAST(substr(d.ts_str, 24, 2) AS INT) <= 59 THEN
+                        epoch_ms(try_strptime(substr(d.ts_str, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+                        - (CASE WHEN substr(d.ts_str, 20, 1) = '+' THEN 1 ELSE -1 END)
+                          * (CAST(substr(d.ts_str, 21, 2) AS BIGINT) * 60 + CAST(substr(d.ts_str, 24, 2) AS BIGINT))
+                          * 60000
+                    ELSE NULL
+                END AS click_ts_ms
+            FROM deduped d
+            JOIN _campaigns c ON d.campaign_id = c.campaign_id
+        )
+        SELECT
+            w.click_id,
+            COALESCE(m.person_id, w.user_id) AS person_id,
+            w.campaign_id,
+            w.click_ts_ms
+        FROM with_ts w
+        LEFT JOIN _canonical_map m ON w.user_id = m.user_id
+        WHERE w.click_ts_ms IS NOT NULL
+          AND w.click_ts_ms >= {min_ts}
+          AND w.click_ts_ms < {window_end_ms}
+    """)
+
+
 def compute_campaign_daily(
     con: duckdb.DuckDBPyConnection,
     sessions_table: str,
@@ -202,7 +366,8 @@ def compute_campaign_daily(
     sessions_table must have:
       session_id, person_id, session_start_ms, day (DATE), revenue_cents, has_purchase
     """
-    _bulk_load_clicks(con, cleaned_clicks)
+    if cleaned_clicks is not None:
+        _bulk_load_clicks(con, cleaned_clicks)
 
     con.execute("DROP TABLE IF EXISTS _campaigns")
     con.execute("""
