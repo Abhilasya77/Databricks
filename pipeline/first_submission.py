@@ -203,7 +203,7 @@ def _sessions_to_duckdb(con, sessions, scratch: Path):
 def compute_both(data_dir: str | Path):
     """V4: validated native event path + teammate's optimized campaign ASOF SQL."""
     from identity_campaign import (
-        load_links_from_dir, load_campaigns, load_and_clean_clicks,
+        load_links_from_dir, load_campaigns, load_clicks_duckdb,
         compute_campaign_daily,
     )
     import duckdb
@@ -232,7 +232,8 @@ def compute_both(data_dir: str | Path):
     con.execute('SET preserve_insertion_order = false')
     _sessions_to_duckdb(con, sessions, scratch)
     try:
-        rel = compute_campaign_daily(con, 'sessions', cleaned_clicks, campaigns)
+        load_clicks_duckdb(con, str(data_dir / 'clicks'), campaigns, identity, start_ms, end_ms)
+        rel = compute_campaign_daily(con, 'sessions', None, campaigns)
         # Materialize while the connection is open; no extra Parquet round-trip.
         names = ['campaign_id','channel','day','sessions','purchasing_sessions',
                  'revenue_cents','assisted_sessions']
