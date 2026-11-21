@@ -48,77 +48,42 @@ inline bool parse_4digits(const char* p, int& out) {
     return true;
 }
 
-// Fast single-field view extraction for LF-only strict CSV lines without allocating per field.
-// If escaped quotes ("") are present, materializes into scratch and points out_view there.
+// Strict LF-only CSV: quotes may wrap a whole field but a value may
+// NEVER contain an embedded quote or comma, even escaped as "".
+// This parser returns string_views into the stable input line and does
+// not allocate field strings while parsing.
 bool extract_strict_field_view(
     std::string_view line,
     size_t& pos,
     bool is_last_col,
-    std::string_view& out_view,
-    std::string& scratch
+    std::string_view& out_view
 ) {
-    bool has_quotes = false;
     const size_t n = line.size();
     if (pos < n && line[pos] == '"') {
-        ++pos;  // skip opening quote
-        const size_t content_start = pos;
-        bool closed = false;
-        while (pos < n) {
-            if (line[pos] == '"') {
-                if (!is_last_col && pos + 1 < n && line[pos + 1] == '"') {
-                    has_quotes = true;
-                    pos += 2;
-                } else {
-                    const size_t content_end = pos;
-                    ++pos;
-                    closed = true;
-                    out_view = line.substr(content_start, content_end - content_start);
-                    break;
-                }
-            } else {
-                ++pos;
-            }
+        ++pos;
+        const size_t start = pos;
+        while (pos < n && line[pos] != '"') {
+            if (line[pos] == ',') return false;
+            ++pos;
         }
-        if (!closed) return false;
-        if (!is_last_col) {
-            if (pos >= n || line[pos] != ',') return false;
-            ++pos;  // skip comma
-        } else {
-            if (pos != n) return false;
-        }
-        if (has_quotes) {
-            scratch.clear();
-            scratch.reserve(out_view.size());
-            for (size_t k = 0; k < out_view.size(); ++k) {
-                if (out_view[k] == '"' && k + 1 < out_view.size() && out_view[k + 1] == '"') {
-                    scratch.push_back('"');
-                    ++k;
-                } else {
-                    scratch.push_back(out_view[k]);
-                }
-            }
-            out_view = scratch;
-        }
+        if (pos == n) return false;
+        out_view = line.substr(start, pos - start);
+        ++pos;  // closing quote
+        if (is_last_col) return pos == n;
+        if (pos >= n || line[pos] != ',') return false;
+        ++pos;
         return true;
     }
 
     const size_t start = pos;
-    if (is_last_col) {
-        while (pos < n) {
-            if (line[pos] == '"') return false;
-            ++pos;
-        }
-        out_view = line.substr(start, n - start);
-        return true;
-    }
-
     while (pos < n && line[pos] != ',') {
         if (line[pos] == '"') return false;
         ++pos;
     }
-    if (pos >= n || line[pos] != ',') return false;
     out_view = line.substr(start, pos - start);
-    ++pos;  // skip comma
+    if (is_last_col) return pos == n;
+    if (pos == n) return false;
+    ++pos;
     return true;
 }
 
@@ -127,17 +92,13 @@ bool parse_strict_4cols(
     std::string_view& c0,
     std::string_view& c1,
     std::string_view& c2,
-    std::string_view& c3,
-    std::string& scratch0,
-    std::string& scratch1,
-    std::string& scratch2,
-    std::string& scratch3
+    std::string_view& c3
 ) {
     size_t pos = 0;
-    if (!extract_strict_field_view(line, pos, false, c0, scratch0)) return false;
-    if (!extract_strict_field_view(line, pos, false, c1, scratch1)) return false;
-    if (!extract_strict_field_view(line, pos, false, c2, scratch2)) return false;
-    if (!extract_strict_field_view(line, pos, true, c3, scratch3)) return false;
+    if (!extract_strict_field_view(line, pos, false, c0)) return false;
+    if (!extract_strict_field_view(line, pos, false, c1)) return false;
+    if (!extract_strict_field_view(line, pos, false, c2)) return false;
+    if (!extract_strict_field_view(line, pos, true, c3)) return false;
     return pos == line.size();
 }
 
@@ -217,7 +178,9 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
             all_digits = false;
             break;
         }
-        epoch_val = epoch_val * 10 + static_cast<int64_t>(ch - '0');
+        const int64_t digit = static_cast<int64_t>(ch - '0');
+        if (epoch_val > (INT64_MAX - digit) / 10) return false;
+        epoch_val = epoch_val * 10 + digit;
     }
     if (all_digits) {
         out_ms = epoch_val;
@@ -379,7 +342,6 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             return a.filename().string() < b.filename().string();
         });
 
-        std::string scratch0, scratch1, scratch2, scratch3;
         std::string line;
 
         for (const auto& file_path : click_files) {
@@ -390,7 +352,7 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             while (std::getline(in, line)) {
                 if (line.empty()) continue;
                 std::string_view c0, c1, c2, c3;
-                if (!parse_strict_4cols(line, c0, c1, c2, c3, scratch0, scratch1, scratch2, scratch3)) continue;
+                if (!parse_strict_4cols(line, c0, c1, c2, c3)) continue;
 
                 // Deduplicate first before validation per pipeline rules
                 if (c0.empty()) continue;
