@@ -375,35 +375,78 @@ int main(int argc,char**argv){
     if(inserted)category_names.push_back(name);
     return it->second;
   };
-  array<string_view,7> columns;
-  for(const auto &shard:shards)for(const auto &entry:shard.rows){
-    const Raw &r=entry.second;
-    // Every stored line was already checked as syntactically valid CSV.
-    if(!parse_event_views(r.line,columns))throw runtime_error("internal CSV invariant");
-    const string_view user=columns[1], tsstr=columns[2],
-                      event_type=columns[4], product=columns[5], price=columns[6];
-    if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
-    i64 ts,ingest;
-    if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(columns[3],ingest)||ingest-ts>DAY_MS)continue;
-    i64 cents=0;
-    const bool purchase=event_type=="purchase";
-    if(purchase){
-      if(!digits(price,0,price.size()))continue;
-      for(char c:price){int x=c-'0';if(cents>10000000/10) {cents=10000001;break;}cents=cents*10+x;if(cents>10000000)break;}
-      if(cents<1||cents>10000000)continue;
+  // V22: parse and validate each disjoint dedup shard in parallel.
+  // Borrow string_views from Raw rows until after all users/categories are
+  // interned. Consume shard results in baseline order for deterministic output.
+  struct ParsedEvent {
+    i64 ts, cents;
+    string_view user, product;
+    bool purchase;
+  };
+  vector<vector<ParsedEvent>> parsed(SHARD_COUNT);
+  auto validate_shard=[&](size_t slot){
+    auto &out=parsed[slot];
+    out.reserve(shards[slot].rows.size());
+    array<string_view,7> columns;
+    for(const auto &entry:shards[slot].rows){
+      const Raw &r=entry.second;
+      if(!parse_event_views(r.line,columns))throw runtime_error("internal CSV invariant");
+      const string_view user=columns[1], tsstr=columns[2],
+                        event_type=columns[4], product=columns[5], price=columns[6];
+      if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
+      i64 ts,ingest;
+      if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(columns[3],ingest)||ingest-ts>DAY_MS)continue;
+      i64 cents=0;
+      const bool purchase=event_type=="purchase";
+      if(purchase){
+        if(!digits(price,0,price.size()))continue;
+        for(char c:price){int x=c-'0';if(cents>10000000/10) {cents=10000001;break;}cents=cents*10+x;if(cents>10000000)break;}
+        if(cents<1||cents>10000000)continue;
+      }
+      out.push_back(ParsedEvent{ts,cents,user,product,purchase});
     }
-    auto id=ids.find(string(user));
-    string person_name=id==ids.end()?string(user):id->second;
+  };
+  size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
+  if(validation_threads<=1){
+    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s);
+  }else{
+    atomic<size_t> next_shard{0};
+    exception_ptr failure;
+    mutex failure_lock;
+    auto worker=[&](){
+      try{
+        for(;;){
+          auto slot=next_shard.fetch_add(1,memory_order_relaxed);
+          if(slot>=SHARD_COUNT)break;
+          validate_shard(slot);
+        }
+      }catch(...){
+        lock_guard<mutex> g(failure_lock);
+        if(!failure)failure=current_exception();
+      }
+    };
+    vector<thread> workers;
+    workers.reserve(validation_threads);
+    for(size_t i=0;i<validation_threads;++i)workers.emplace_back(worker);
+    for(auto &t:workers)t.join();
+    if(failure)rethrow_exception(failure);
+  }
+  profile("event_parse_parallel");
+  // Preserve the baseline's single-threaded person/category interning order.
+  for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
+    auto id=ids.find(string(p.user));
+    string person_name=id==ids.end()?string(p.user):id->second;
     auto [person_it, inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
     if(inserted)people.push_back(std::move(person_name));
     uint32_t cat_id=0;
-    if(purchase){
-      auto cat_it=categories.find(string(product));
+    if(p.purchase){
+      auto cat_it=categories.find(string(p.product));
       static const string unknown="unknown";
       cat_id=category_number(cat_it==categories.end()?unknown:cat_it->second);
     }
-    events.push_back(Event{ts,cents,person_it->second,cat_id,purchase});
+    events.push_back(Event{p.ts,p.cents,person_it->second,cat_id,p.purchase});
   }
+  vector<vector<ParsedEvent>>().swap(parsed);
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
   for(auto &shard:shards){shard.rows.clear();}
