@@ -219,13 +219,54 @@ int main(int argc,char**argv){
       tasks.push_back(Task{p,begin,min(len,begin+CHUNK_BYTES)});
   }
   constexpr size_t SHARD_COUNT=128;
-  struct Shard { mutex lock; unordered_map<string,Raw> rows; };
+  // V24 experimental: flat open-addressed index, contiguous entries.
+  // Full IDs are always compared, so hash collisions cannot merge events.
+  struct FlatRows {
+    struct Entry { string first; Raw second; size_t hash_code; };
+    vector<Entry> entries;
+    vector<uint32_t> slots; // 1-based index, zero means empty
+    size_t size() const { return entries.size(); }
+    void rehash_to(size_t capacity) {
+      vector<uint32_t> new_slots(capacity, 0);
+      for(size_t idx=0; idx<entries.size(); ++idx){
+        size_t pos=(entries[idx].hash_code >> 7) & (capacity-1);
+        while(new_slots[pos]) pos=(pos+1)&(capacity-1);
+        new_slots[pos]=static_cast<uint32_t>(idx+1);
+      }
+      slots.swap(new_slots);
+    }
+    void reserve(size_t n){
+      entries.reserve(n);
+      size_t capacity=16;
+      while(capacity < n*2)capacity*=2;
+      rehash_to(capacity);
+    }
+    pair<Entry*, bool> try_emplace(string_view key,size_t hash_code){
+      if(slots.empty()) rehash_to(16);
+      // Never permit a load factor above 0.70.
+      if((entries.size()+1)*10 >= slots.size()*7)
+        rehash_to(slots.size()*2);
+      size_t pos=(hash_code >> 7)&(slots.size()-1);
+      while(slots[pos]){
+        Entry &e=entries[slots[pos]-1];
+        if(e.hash_code==hash_code && e.first==key)return {&e,false};
+        pos=(pos+1)&(slots.size()-1);
+      }
+      if(entries.size()==UINT32_MAX) throw runtime_error("too many event IDs per shard");
+      entries.push_back(Entry{string(key), Raw{}, hash_code});
+      slots[pos]=static_cast<uint32_t>(entries.size());
+      return {&entries.back(),true};
+    }
+    auto begin() const {return entries.begin();}
+    auto end() const {return entries.end();}
+    void clear(){entries.clear();slots.clear();}
+    void rehash(int){} // compatibility with existing cleanup loop
+  };
+  struct Shard { mutex lock; FlatRows rows; };
   array<Shard,SHARD_COUNT> shards;
-  // Pre-size event ID shard buckets to avoid repeated hash-table growth.
-  // Cap initial table size so large hidden data does not oversubscribe RAM.
   const size_t hint_per_shard = min<size_t>(
       250000, static_cast<size_t>(estimated_bytes / 150 / SHARD_COUNT));
-  for (auto &shard : shards) shard.rows.reserve(hint_per_shard);
+  for(auto &shard:shards)shard.rows.reserve(hint_per_shard);
 
   auto read_task=[&](const Task &task){
     ifstream in(task.path,ios::binary);
@@ -241,9 +282,10 @@ int main(int argc,char**argv){
         if(parse_event_views(line,fields)&&!fields[0].empty()){
           const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
           const uint32_t il=static_cast<uint32_t>(fields[3].size());
-          Shard &shard=shards[hash<string_view>{}(fields[0])&(SHARD_COUNT-1)];
+          const size_t idhash=hash<string_view>{}(fields[0]);
+          Shard &shard=shards[idhash&(SHARD_COUNT-1)];
           lock_guard<mutex> guard(shard.lock);
-          auto [it,inserted]=shard.rows.try_emplace(string(fields[0]));
+          auto [it,inserted]=shard.rows.try_emplace(fields[0], idhash);
           if(inserted)it->second=Raw{line,ip,il};
           else {
             Raw &prev=it->second;
@@ -265,9 +307,10 @@ int main(int argc,char**argv){
         if(parse_event_views(line,fields)&&!fields[0].empty()){
           const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
           const uint32_t il=static_cast<uint32_t>(fields[3].size());
-          Shard &shard=shards[hash<string_view>{}(fields[0])&(SHARD_COUNT-1)];
+          const size_t idhash=hash<string_view>{}(fields[0]);
+          Shard &shard=shards[idhash&(SHARD_COUNT-1)];
           lock_guard<mutex> guard(shard.lock);
-          auto [it,inserted]=shard.rows.try_emplace(string(fields[0]));
+          auto [it,inserted]=shard.rows.try_emplace(fields[0], idhash);
           if(inserted)it->second=Raw{line,ip,il};
           else {
             Raw &prev=it->second;
@@ -363,7 +406,7 @@ int main(int argc,char**argv){
   }
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
-  for(auto &shard:shards){shard.rows.clear();shard.rows.rehash(0);}
+  for(auto &shard:shards){shard.rows.clear();}
   // Assign each person a lexicographic rank so the global sort compares
   // integers, not UTF-8 strings, for every event comparison.
   vector<uint32_t> order(people.size());
