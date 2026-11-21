@@ -1,6 +1,6 @@
 """Shopping Sessions — event cleaning, session construction, and user_daily.
 
-First correctness-focused implementation. It uses only the Python standard library;
+Correctness-validated implementation with faster timestamp and CSV parsing. It uses only the Python standard library;
 its outputs are Python records to hand to the team's attribution/Parquet writer.
 
 This module does not do click attribution or write either Parquet table.
@@ -32,67 +32,91 @@ DIGITS = re.compile(r"^[0-9]+$")
 
 
 def parse_timestamp_ms(raw: str) -> int | None:
-    """Parse exactly F1, F2 or positive epoch-ms digits from rules.md."""
+    """Strict F1/F2/epoch-ms parser optimized for the buildathon dialect.
+
+    Unlike permissive datetime parsers, this rejects lower-case separators,
+    malformed zones, Unicode digits and fractional seconds. Ingest timestamps
+    also go through this parser, preserving the previous module interface.
+    """
     if not raw:
         return None
-    if raw.isascii() and DIGITS.fullmatch(raw):
-        # Avoid Python's max-integer-string limit on very long F3 input.
-        digits = raw.lstrip("0") or "0"
-        if len(digits) > 18:
-            return None  # Out of any dataset window and 64-bit representable range.
-        return int(digits)
 
-    match = F1.fullmatch(raw)
-    if match:
-        y, month, day, hour, minute, second = map(int, match.groups())
-        offset_min = 0
+    # An epoch timestamp consists ONLY of ASCII digits; leading zeros are legal.
+    # Remove zeros before int() to avoid Python's huge-integer string guard.
+    if '0' <= raw[0] <= '9' and raw.isascii() and raw.isdigit():
+        significant = raw.lstrip('0') or '0'
+        if len(significant) > 18:
+            return None  # far outside every valid dataset time window
+        return int(significant)
+
+    length = len(raw)
+    if length != 20 and length != 25:
+        return None
+    if (raw[4] != '-' or raw[7] != '-' or raw[10] != 'T' or
+        raw[13] != ':' or raw[16] != ':' or not raw.isascii() or
+        not (raw[0:4].isdigit() and raw[5:7].isdigit() and
+             raw[8:10].isdigit() and raw[11:13].isdigit() and
+             raw[14:16].isdigit() and raw[17:19].isdigit())):
+        return None
+
+    if length == 20:
+        if raw[19] != 'Z':
+            return None
+        offset_ms = 0
     else:
-        match = F2.fullmatch(raw)
-        if match is None:
+        if (raw[19] not in ('+', '-') or raw[22] != ':' or
+            not raw[20:22].isdigit() or not raw[23:25].isdigit()):
             return None
-        ys, ms, ds, hs, mins, ss, sign, off_h, off_m = match.groups()
-        y, month, day, hour, minute, second = map(int, (ys, ms, ds, hs, mins, ss))
-        oh, om = int(off_h), int(off_m)
-        if oh > 23 or om > 59:
+        off_h = int(raw[20:22])
+        off_m = int(raw[23:25])
+        if off_h > 23 or off_m > 59:
             return None
-        offset_min = (oh * 60 + om) * (1 if sign == '+' else -1)
+        sign = 1 if raw[19] == '+' else -1
+        offset_ms = sign * (off_h * 60 + off_m) * 60_000
 
+    hour = int(raw[11:13])
+    minute = int(raw[14:16])
+    second = int(raw[17:19])
     if hour > 23 or minute > 59 or second > 59:
         return None
     try:
-        ordinal = date(y, month, day).toordinal()
+        day_ordinal = date.fromisoformat(raw[:10]).toordinal()
     except ValueError:
         return None
-    return ((ordinal - EPOCH_ORDINAL) * 86400 + hour * 3600 + minute * 60 + second - 60 * offset_min) * 1000
+    return ((day_ordinal - EPOCH_ORDINAL) * DAY_MS +
+            hour * 3_600_000 + minute * 60_000 + second * 1000 - offset_ms)
 
 
 def read_strict_csv(path: Path, nfields: int):
-    """Read exactly the stated restricted CSV dialect; preserve trailing CR/spaces.
+    """Parse this competition's restricted CSV, preserving literal CR characters.
 
-    The spec guarantees values never contain comma, quote or LF. Thus every
-    comma is a separator, and quotes are only allowed around the entire field.
-    CSV's common CRLF normalization would be WRONG for this challenge.
+    No field ever contains commas/newlines/escaped quotes. A no-quote fast path
+    avoids parsing every field separately on simple rows. Quoted rows still
+    receive full validation: only an entire field may be quoted.
     """
     with path.open('r', encoding='utf-8', newline='\n') as source:
-        next(source, None)  # All files have one header row.
+        next(source, None)
         for line in source:
             if line.endswith('\n'):
-                line = line[:-1]  # CR is ordinary data; DO NOT strip it.
+                line = line[:-1]
             if not line:
                 continue
-            fields = line.split(',')
-            if len(fields) != nfields:
+            parts = line.split(',')
+            if len(parts) != nfields:
                 continue
-            values = []
-            for value in fields:
-                if '"' not in value:
-                    values.append(value)
-                elif len(value) >= 2 and value[0] == '"' and value[-1] == '"' and '"' not in value[1:-1]:
-                    values.append(value[1:-1])
+            if '"' not in line:
+                yield tuple(parts)
+                continue
+            fields = []
+            for item in parts:
+                if '"' not in item:
+                    fields.append(item)
+                elif len(item) >= 2 and item[0] == '"' and item[-1] == '"' and '"' not in item[1:-1]:
+                    fields.append(item[1:-1])
                 else:
                     break
             else:
-                yield tuple(values)
+                yield tuple(fields)
 
 
 def input_parts(data_dir: str | Path, category: str):
