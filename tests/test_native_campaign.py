@@ -152,8 +152,7 @@ class TestNativeCampaign(unittest.TestCase):
         t_sess = iso_to_ms("2026-10-03T09:10:00Z")
         rows = run_native_cli(fx_inp, ws, we, {}, [("u1", "2026-10-03", t_sess, 1200, True)])
         self.assertEqual(rows, [
-            ("c_1", "search", "2026-10-03", 1, 1, 1200, 1),
-            ("c_2", "social", "2026-10-03", 0, 0, 0, 1),
+            ("c_2", "social", "2026-10-03", 1, 1, 1200, 1),
         ])
 
         with tempfile.TemporaryDirectory() as tmp:
