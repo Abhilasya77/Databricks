@@ -2,6 +2,8 @@
 // and user_daily aggregation. Strictly follows the challenge CSV dialect.
 // Compile: c++ -std=c++17 -O3 -DNDEBUG native_events.cpp -o native_events
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -19,12 +22,12 @@ namespace fs = std::filesystem;
 using i64 = int64_t;
 static constexpr i64 DAY_MS=86400000, GAP_MS=1800000;
 
-static bool digits(const string &s, size_t a, size_t b){
+static bool digits(string_view s, size_t a, size_t b){
   if(a>=b || b>s.size())return false;
   for(size_t i=a;i<b;i++)if(s[i]<'0'||s[i]>'9')return false;
   return true;
 }
-static int number(const string &s,size_t a,size_t b){int n=0; for(size_t i=a;i<b;i++)n=n*10+(s[i]-'0'); return n;}
+static int number(string_view s,size_t a,size_t b){int n=0; for(size_t i=a;i<b;i++)n=n*10+(s[i]-'0'); return n;}
 static bool leap(int y){return y%4==0&&(y%100!=0||y%400==0);}
 // Day number of 1970-01-01 is zero. Howard Hinnant civil calendar algorithm.
 static i64 days_from_civil(int y,unsigned m,unsigned d){
@@ -35,7 +38,7 @@ static i64 days_from_civil(int y,unsigned m,unsigned d){
   const unsigned yday=yoe*365+yoe/4-yoe/100+doy;
   return era*146097+static_cast<int>(yday)-719468;
 }
-static bool parse_ts(const string &s,i64 &out){
+static bool parse_ts(string_view s,i64 &out){
   if(s.empty())return false;
   if(digits(s,0,s.size())){
     i64 acc=0;
@@ -81,6 +84,28 @@ static bool parse_line(const string &line,size_t fields,vector<string> &out){
   }
   return out.size()==fields;
 }
+// Zero-allocation parser for event rows. Views remain valid while `line` lives.
+// The challenge dialect has no escaped quotes and no quoted commas.
+static bool parse_event_views(const string &line, array<string_view,7> &out){
+  if(line.empty())return false;
+  size_t begin=0;
+  for(size_t i=0;i<7;++i){
+    size_t end=line.find(',',begin);
+    if(i<6 && end==string::npos)return false;
+    if(i==6 && end!=string::npos)return false;
+    if(end==string::npos)end=line.size();
+    string_view value(line.data()+begin,end-begin);
+    if(value.find('"')!=string_view::npos){
+      if(value.size()<2||value.front()!='"'||value.back()!='"'||
+         value.find('"',1)!=value.size()-1)return false;
+      value.remove_prefix(1);value.remove_suffix(1);
+    }
+    out[i]=value;
+    begin=end+1;
+  }
+  return true;
+}
+
 static vector<fs::path> parts(const fs::path &dir){
   vector<fs::path> files;
   if(!fs::exists(dir))return files;
@@ -143,8 +168,8 @@ static string day_string(i64 ts){
   char str[16];snprintf(str,sizeof(str),"%04d-%02u-%02u",y,m,d);
   return str;
 }
-struct Raw{string line, ingest;};
-struct Event{string person,product; i64 ts=0, cents=0; bool purchase=false;};
+struct Raw{string line; uint32_t ingest_pos=0, ingest_len=0;};
+struct Event{ i64 ts=0, cents=0; uint32_t person=0, category=0; bool purchase=false;};
 struct Session{
   string person, day; i64 start=0,events=0,revenue=0;
   bool purchased=false;
@@ -180,26 +205,43 @@ int main(int argc,char**argv){
     ifstream in(p,ios::binary);
     if(!in)throw runtime_error("can't open "+p.string());
     string line;getline(in,line);
-    vector<string> fields;
+    array<string_view,7> fields;
     while(getline(in,line)){
-      if(!parse_line(line,7,fields)||fields[0].empty())continue;
-      auto it=raw.find(fields[0]);
-      if(it==raw.end())raw.emplace(fields[0],Raw{line,fields[3]});
-      else if(fields[3]<it->second.ingest)it->second=Raw{line,fields[3]};
+      if(!parse_event_views(line,fields)||fields[0].empty())continue;
+      const auto ingest_pos=static_cast<uint32_t>(fields[3].data()-line.data());
+      const auto ingest_len=static_cast<uint32_t>(fields[3].size());
+      auto [it, inserted]=raw.try_emplace(string(fields[0]));
+      if(inserted)it->second=Raw{line,ingest_pos,ingest_len};
+      else {
+        const Raw &previous=it->second;
+        const string_view old_ingest(previous.line.data()+previous.ingest_pos,previous.ingest_len);
+        if(fields[3]<old_ingest)it->second=Raw{line,ingest_pos,ingest_len};
+      }
     }
   }
   profile("event_dedup");
   vector<Event> events;events.reserve(raw.size());
-  vector<string> columns;
+  // Intern the canonical person and purchase category once. Events now store
+  // 32-byte POD records instead of two separately allocated strings.
+  unordered_map<string,uint32_t> person_ids;
+  vector<string> people;
+  unordered_map<string,uint32_t> category_ids;
+  vector<string> category_names;
+  auto category_number=[&](const string &name)->uint32_t{
+    auto [it,inserted]=category_ids.try_emplace(name,static_cast<uint32_t>(category_names.size()));
+    if(inserted)category_names.push_back(name);
+    return it->second;
+  };
+  array<string_view,7> columns;
   for(const auto &entry:raw){
     const Raw &r=entry.second;
     // Every stored line was already checked as syntactically valid CSV.
-    if(!parse_line(r.line,7,columns))throw runtime_error("internal CSV invariant");
-    const string &user=columns[1], &tsstr=columns[2],
-                 &event_type=columns[4], &product=columns[5], &price=columns[6];
+    if(!parse_event_views(r.line,columns))throw runtime_error("internal CSV invariant");
+    const string_view user=columns[1], tsstr=columns[2],
+                      event_type=columns[4], product=columns[5], price=columns[6];
     if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
     i64 ts,ingest;
-    if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(r.ingest,ingest)||ingest-ts>DAY_MS)continue;
+    if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(columns[3],ingest)||ingest-ts>DAY_MS)continue;
     i64 cents=0;
     const bool purchase=event_type=="purchase";
     if(purchase){
@@ -207,12 +249,37 @@ int main(int argc,char**argv){
       for(char c:price){int x=c-'0';if(cents>10000000/10) {cents=10000001;break;}cents=cents*10+x;if(cents>10000000)break;}
       if(cents<1||cents>10000000)continue;
     }
-    auto id=ids.find(user);
-    events.push_back(Event{id==ids.end()?user:id->second,product,ts,cents,purchase});
+    auto id=ids.find(string(user));
+    string person_name=id==ids.end()?string(user):id->second;
+    auto [person_it, inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
+    if(inserted)people.push_back(std::move(person_name));
+    uint32_t cat_id=0;
+    if(purchase){
+      auto cat_it=categories.find(string(product));
+      static const string unknown="unknown";
+      cat_id=category_number(cat_it==categories.end()?unknown:cat_it->second);
+    }
+    events.push_back(Event{ts,cents,person_it->second,cat_id,purchase});
   }
   profile("event_validate");
   raw.clear();raw.rehash(0);
-  sort(events.begin(),events.end(),[](const Event&a,const Event&b){return a.person==b.person?a.ts<b.ts:a.person<b.person;});
+  // Assign each person a lexicographic rank so the global sort compares
+  // integers, not UTF-8 strings, for every event comparison.
+  vector<uint32_t> order(people.size());
+  iota(order.begin(),order.end(),0U);
+  sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b){return people[a]<people[b];});
+  vector<uint32_t> rank(people.size());
+  vector<string> sorted_people(people.size());
+  for(size_t i=0;i<order.size();++i){
+    rank[order[i]]=static_cast<uint32_t>(i);
+    sorted_people[i]=move(people[order[i]]);
+  }
+  for(auto &e:events)e.person=rank[e.person];
+  vector<string>().swap(people);
+  unordered_map<string,uint32_t>().swap(person_ids);
+  sort(events.begin(),events.end(),[](const Event&a,const Event&b){
+    return a.person==b.person ? a.ts<b.ts : a.person<b.person;
+  });
   profile("event_sort");
   ofstream so(argv[4],ios::binary);
   ofstream uo(argv[3],ios::binary);
@@ -224,7 +291,7 @@ int main(int argc,char**argv){
   Daily daily;
   bool have_session=false, have_daily=false;
   i64 prev=0, session_count=0, daily_count=0;
-  string last_person;
+  uint32_t last_person=UINT32_MAX;
   auto flush_daily=[&](){
     if(!have_daily)return;
     string best;bool has=false;i64 bestsum=0;
@@ -256,15 +323,13 @@ int main(int argc,char**argv){
   for(const Event &e:events){
     if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
       flush_session();
-      cur=Session{e.person,day_string(e.ts),e.ts};
+      cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
       have_session=true;
     }
     ++cur.events;
     if(e.purchase){
       cur.purchased=true;cur.revenue+=e.cents;
-      auto it=categories.find(e.product);
-      const string &cat=it==categories.end()?static_cast<const string&>("unknown"):it->second;
-      cur.category_revenue[cat]+=e.cents;
+      cur.category_revenue[category_names[e.category]]+=e.cents;
     }
     prev=e.ts;last_person=e.person;
   }
