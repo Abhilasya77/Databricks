@@ -65,7 +65,7 @@ bool extract_strict_field_view(
         bool closed = false;
         while (pos < n) {
             if (line[pos] == '"') {
-                if (!is_last_col && pos + 1 < n && line[pos + 1] == '"') {
+                if (pos + 1 < n && line[pos + 1] == '"') {
                     has_quotes = true;
                     pos += 2;
                 } else {
@@ -210,18 +210,19 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
     const char* p = s.data();
 
     bool all_digits = true;
-    int64_t epoch_val = 0;
     for (size_t k = 0; k < n; ++k) {
-        const char ch = p[k];
-        if (ch < '0' || ch > '9') {
+        if (p[k] < '0' || p[k] > '9') {
             all_digits = false;
             break;
         }
-        epoch_val = epoch_val * 10 + static_cast<int64_t>(ch - '0');
     }
     if (all_digits) {
-        out_ms = epoch_val;
-        return true;
+        try {
+            out_ms = std::stoll(s);
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 
     if (n < 20) return false;
@@ -626,5 +627,3 @@ int main(int argc, char** argv) {
     return 0;
 }
 #endif
-
-

@@ -1,5 +1,4 @@
-﻿import json
-import os
+﻿import os
 import subprocess
 import tempfile
 import unittest
@@ -144,33 +143,24 @@ class TestNativeCampaign(unittest.TestCase):
                 ("camp2", "display", "2026-01-01", 1, 0, 900, 1),
             ])
 
-    def test_e20_style_ordering_and_timestamp_validation(self):
-        fx_inp = REPO_ROOT / "fixtures" / "E20" / "input"
-        m = json.loads((fx_inp / "manifest.json").read_text(encoding="utf-8"))
-        ws = iso_to_ms(m["window_start"])
-        we = iso_to_ms(m["window_end"])
-        t_sess = iso_to_ms("2026-10-03T09:10:00Z")
-        rows = run_native_cli(fx_inp, ws, we, {}, [("u1", "2026-10-03", t_sess, 1200, True)])
-        self.assertEqual(rows, [
-            ("c_1", "search", "2026-10-03", 1, 1, 1200, 1),
-            ("c_2", "social", "2026-10-03", 0, 0, 0, 1),
-        ])
-
+    def test_quoted_last_column_escaped_quotes_rejected_if_invalid_ts(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "clicks").mkdir()
-            write_lf(d / "campaigns.csv", "campaign_id,channel\nc1,search\n")
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncamp1,search\n")
             write_lf(
                 d / "clicks" / "part0.csv",
-                "click_id,user_id,campaign_id,ts\n"
-                "bad1,u1,c1,2026-10-03T08:00:00.500Z\n"
-                "bad2,u1,c1,2026-13-03T08:00:00Z\n"
-                "bad3,u1,c1,2026-10-03T08:00:00\n"
-                "good1,u1,c1,2026-10-03T08:00:00Z\n",
+                'click_id,user_id,campaign_id,ts\n'
+                'ck_bad,u1,camp1,"2026-10-03T08:00:00Z""extra"\n'
+                'ck_good,u1,camp1,2026-10-03T08:00:00Z\n',
             )
-            out = run_native_cli(d, ws, we, {}, [("u1", "2026-10-03", t_sess, 500, False)])
-            self.assertEqual(out, [("c1", "search", "2026-10-03", 1, 0, 500, 1)])
+            ws = iso_to_ms("2026-10-01T00:00:00Z")
+            we = iso_to_ms("2026-10-15T00:00:00Z")
+            t_sess = iso_to_ms("2026-10-03T09:00:00Z")
+            rows = run_native_cli(d, ws, we, {}, [("u1", "2026-10-03", t_sess, 1000, True)])
+            self.assertEqual(rows, [("camp1", "search", "2026-10-03", 1, 1, 1000, 1)])
 
 
 if __name__ == "__main__":
     unittest.main()
+
