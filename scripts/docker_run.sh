@@ -31,4 +31,5 @@ docker run --rm --platform "$PLATFORM" \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
   -e SHOPPING_PROFILE="${SHOPPING_PROFILE:-0}" \
+  -e SHOPPING_NATIVE_THREADS="${SHOPPING_NATIVE_THREADS:-${CPUS%.*}}" \
   "$IMAGE"
