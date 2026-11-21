@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Mapping
 import csv
 import os
+import time
+import sys
+from contextlib import nullcontext
 
 from events_sessions import (
     Session, input_parts, load_window, read_strict_csv, parse_timestamp_ms,
@@ -160,6 +163,31 @@ def _sessions_to_duckdb(con, sessions, scratch: Path):
     import tempfile
 
     con.execute("DROP TABLE IF EXISTS sessions")
+    if isinstance(sessions, (str, Path)):
+        # Fast path: C++ already emitted valid, schema-checked session JSONL.
+        # DuckDB reads it directly, without Python object construction or rewrite.
+        path = Path(sessions)
+        if path.stat().st_size == 0:
+            con.execute("""CREATE TEMP TABLE sessions (
+                session_id BIGINT, person_id VARCHAR, session_start_ms BIGINT,
+                day DATE, revenue_cents BIGINT, has_purchase BOOLEAN
+            )""")
+        else:
+            safe_path = str(path).replace("'", "''")
+            con.execute(f"""CREATE TEMP TABLE sessions AS
+                SELECT session_id::BIGINT AS session_id,
+                       person_id::VARCHAR AS person_id,
+                       session_start_ms::BIGINT AS session_start_ms,
+                       CAST(day AS DATE) AS day,
+                       revenue_cents::BIGINT AS revenue_cents,
+                       has_purchase::BOOLEAN AS has_purchase
+                FROM read_json('{safe_path}', format='newline_delimited', columns={{
+                    'session_id':'BIGINT', 'person_id':'VARCHAR',
+                    'session_start_ms':'BIGINT', 'day':'VARCHAR',
+                    'revenue_cents':'BIGINT', 'has_purchase':'BOOLEAN'
+                }})
+            """)
+        return
     if not sessions:
         con.execute("""CREATE TEMP TABLE sessions (
             session_id BIGINT, person_id VARCHAR, session_start_ms BIGINT,
@@ -209,34 +237,53 @@ def compute_both(data_dir: str | Path):
     import duckdb
 
     data_dir = Path(data_dir)
-    # Use teammate's DSU, now with the exact challenge CSV parser.
-    identity = load_links_from_dir(str(data_dir / 'links'))
-    if os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1':
-        from native_events_bridge import compute_events_sessions_native
-        sessions, users = compute_events_sessions_native(data_dir, identity)
-    else:
-        sessions, users = compute_events_sessions(data_dir, identity)
+    profile = os.environ.get('SHOPPING_PROFILE') == '1'
+    last = time.perf_counter()
+    def mark(label):
+        nonlocal last
+        now = time.perf_counter()
+        if profile:
+            print(f'PROFILE {label}_seconds={now-last:.3f}', file=sys.stderr)
+        last = now
 
-    start_ms, end_ms = load_window(data_dir)
-    campaigns = load_campaigns(str(data_dir / 'campaigns.csv'))
-    cleaned_clicks = load_and_clean_clicks(str(data_dir / 'clicks'), campaigns,
-                                           identity, start_ms, end_ms)
-    scratch = Path(os.environ.get('SCRATCH_DIR') or '/tmp')
-    scratch.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
-    ncpu = max(1, int(os.environ.get('NCPU') or os.cpu_count() or 1))
-    mem_gb = max(1, int(os.environ.get('MEM_GB') or 8))
-    con.execute(f'SET threads = {ncpu}')
-    con.execute(f"SET memory_limit = '{max(1,int(mem_gb*0.8))}GB'")
-    con.execute(f"SET temp_directory = '{str(scratch / 'duckdb_tmp').replace(chr(39),chr(39)*2)}'")
-    con.execute('SET preserve_insertion_order = false')
-    _sessions_to_duckdb(con, sessions, scratch)
-    try:
-        rel = compute_campaign_daily(con, 'sessions', cleaned_clicks, campaigns)
-        # Materialize while the connection is open; no extra Parquet round-trip.
-        names = ['campaign_id','channel','day','sessions','purchasing_sessions',
-                 'revenue_cents','assisted_sessions']
-        result = [dict(zip(names, row)) for row in rel.fetchall()]
-    finally:
-        con.close()
-    return users, result
+    identity = load_links_from_dir(str(data_dir / 'links'))
+    mark('identity_links')
+    native = os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1'
+    if native:
+        from native_events_bridge import native_event_files
+        engine_context = native_event_files(data_dir, identity)
+    else:
+        engine_context = nullcontext(None)
+
+    with engine_context as native_result:
+        if native:
+            sessions, users = native_result
+        else:
+            sessions, users = compute_events_sessions(data_dir, identity)
+        mark('events_and_user_daily')
+
+        start_ms, end_ms = load_window(data_dir)
+        campaigns = load_campaigns(str(data_dir / 'campaigns.csv'))
+        cleaned_clicks = load_and_clean_clicks(str(data_dir / 'clicks'), campaigns,
+                                               identity, start_ms, end_ms)
+        mark('clicks_parse_and_dedup')
+        scratch = Path(os.environ.get('SCRATCH_DIR') or '/tmp')
+        scratch.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect()
+        ncpu = max(1, int(os.environ.get('NCPU') or os.cpu_count() or 1))
+        mem_gb = max(1, int(os.environ.get('MEM_GB') or 8))
+        con.execute(f'SET threads = {ncpu}')
+        con.execute(f"SET memory_limit = '{max(1,int(mem_gb*0.8))}GB'")
+        con.execute(f"SET temp_directory = '{str(scratch / 'duckdb_tmp').replace(chr(39),chr(39)*2)}'")
+        con.execute('SET preserve_insertion_order = false')
+        _sessions_to_duckdb(con, sessions, scratch)
+        mark('sessions_duckdb_load')
+        try:
+            rel = compute_campaign_daily(con, 'sessions', cleaned_clicks, campaigns)
+            names = ['campaign_id','channel','day','sessions','purchasing_sessions',
+                     'revenue_cents','assisted_sessions']
+            result = [dict(zip(names, row)) for row in rel.fetchall()]
+            mark('campaign_sql_and_fetch')
+        finally:
+            con.close()
+        return users, result

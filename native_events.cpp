@@ -2,6 +2,7 @@
 // and user_daily aggregation. Strictly follows the challenge CSV dialect.
 // Compile: c++ -std=c++17 -O3 -DNDEBUG native_events.cpp -o native_events
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -152,6 +153,15 @@ struct Session{
 struct Daily{string person,day; i64 sessions=0,events=0,revenue=0;unordered_map<string,i64> categories;};
 int main(int argc,char**argv){
  try{
+  auto last_profile=chrono::steady_clock::now();
+  auto profile=[&](const char *phase){
+    auto now=chrono::steady_clock::now();
+    if(const char* p=std::getenv("SHOPPING_PROFILE"); p && *p == '1'){
+      double sec=chrono::duration<double>(now-last_profile).count();
+      cerr<<"PROFILE native_"<<phase<<"_seconds="<<sec<<"\n";
+    }
+    last_profile=now;
+  };
   if(argc!=5){cerr<<"usage: native_events DATA_DIR ID_MAP_BIN USERS_JSONL SESSIONS_JSONL\n";return 2;}
   fs::path data=argv[1];unordered_map<string,string> ids;
   read_map(argv[2],ids);
@@ -162,6 +172,7 @@ int main(int argc,char**argv){
               !parse_ts(json_property(manifest,"window_end"),hi))throw runtime_error("bad window");
   unordered_map<string,string> categories;
   each_line(data/"products.csv",2,[&](const vector<string>&v){categories.emplace(v[0],v[1]);});
+  profile("metadata_and_identity");
   // Store one compact raw line per event_id instead of six separate strings.
   // Dedup still precedes validation (including late/invalid timestamps).
   unordered_map<string,Raw> raw;
@@ -177,6 +188,7 @@ int main(int argc,char**argv){
       else if(fields[3]<it->second.ingest)it->second=Raw{line,fields[3]};
     }
   }
+  profile("event_dedup");
   vector<Event> events;events.reserve(raw.size());
   vector<string> columns;
   for(const auto &entry:raw){
@@ -198,8 +210,10 @@ int main(int argc,char**argv){
     auto id=ids.find(user);
     events.push_back(Event{id==ids.end()?user:id->second,product,ts,cents,purchase});
   }
+  profile("event_validate");
   raw.clear();raw.rehash(0);
   sort(events.begin(),events.end(),[](const Event&a,const Event&b){return a.person==b.person?a.ts<b.ts:a.person<b.person;});
+  profile("event_sort");
   ofstream so(argv[4],ios::binary);
   ofstream uo(argv[3],ios::binary);
   if(!so||!uo)throw runtime_error("output not writable");
@@ -256,6 +270,7 @@ int main(int argc,char**argv){
   }
   flush_session();flush_daily();
   so.close();uo.close();
+  profile("sessionize_and_json_output");
   cerr<<"native_events: clean="<<events.size()<<" sessions="<<session_count<<" user_days="<<daily_count<<"\n";
   return 0;
  }catch(const exception &e){cerr<<"native_events error: "<<e.what()<<"\n";return 1;}
