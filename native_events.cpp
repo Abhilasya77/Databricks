@@ -419,10 +419,16 @@ int main(int argc,char**argv){
   };
   auto flush_session=[&](){
     if(!have_session)return;
-    so<<"{\"session_id\":"<<session_count<<",\"person_id\":"<<json_escape(cur.person)
-      <<",\"session_start_ms\":"<<cur.start<<",\"day\":"<<json_escape(cur.day)
-      <<",\"events\":"<<cur.events<<",\"revenue_cents\":"<<cur.revenue
-      <<",\"has_purchase\":"<<(cur.purchased?"true":"false")<<"}\n";
+    // Direct-native campaign mode receives sessions in memory.  No Python or
+    // SQL consumer reads the session JSONL in that mode, so avoid formatting
+    // and writing hundreds of thousands of redundant session records.
+    // Preserve the four-argument legacy interface byte-for-byte.
+    if(argc==5){
+      so<<"{\"session_id\":"<<session_count<<",\"person_id\":"<<json_escape(cur.person)
+        <<",\"session_start_ms\":"<<cur.start<<",\"day\":"<<json_escape(cur.day)
+        <<",\"events\":"<<cur.events<<",\"revenue_cents\":"<<cur.revenue
+        <<",\"has_purchase\":"<<(cur.purchased?"true":"false")<<"}\n";
+    }
     ++session_count;
     if(argc==6) campaign_sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
     if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
