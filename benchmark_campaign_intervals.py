@@ -1,4 +1,3 @@
-@'
 import time
 import duckdb
 from pipeline.identity_campaign import compute_campaign_daily, SEVEN_DAYS_MS
@@ -104,4 +103,3 @@ def run_benchmark():
 
 if __name__ == "__main__":
     run_benchmark()
-'@ | Set-Content -Path benchmark_campaign_intervals.py -Encoding UTF8
