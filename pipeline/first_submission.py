@@ -263,11 +263,21 @@ def compute_both(data_dir: str | Path):
         mark('events_and_user_daily')
 
         if native:
+            # Return paths while native_event_files still owns the scratch
+            # directory. Output writing must occur INSIDE this context;
+            # pipeline.py therefore uses the retained context manager below.
+            # The standalone compute_both() interface cannot return these
+            # paths after the context closes.
             import json
+            from datetime import date
+            with Path(users).open(encoding='utf-8') as f:
+                user_rows = [json.loads(line) for line in f if line.strip()]
+            for row in user_rows:
+                row['day'] = date.fromisoformat(row['day'])
             with campaign_path.open(encoding='utf-8') as f:
                 result = [json.loads(line) for line in f if line.strip()]
             mark('native_campaign_read')
-            return users, result
+            return user_rows, result
 
         start_ms, end_ms = load_window(data_dir)
         campaigns = load_campaigns(str(data_dir / 'campaigns.csv'))
@@ -294,3 +304,25 @@ def compute_both(data_dir: str | Path):
         finally:
             con.close()
         return users, result
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def compute_native_jsonl_paths(data_dir: str | Path):
+    """Expose native JSONL rows without Python decode/re-encode.
+
+    The context must remain open while DuckDB reads the returned paths.
+    Non-native fallback continues using compute_both().
+    """
+    from identity_campaign import load_links_from_dir
+    from native_events_bridge import native_event_files
+
+    data_dir = Path(data_dir)
+    start = time.perf_counter()
+    identity = load_links_from_dir(str(data_dir / 'links'))
+    if os.environ.get('SHOPPING_PROFILE') == '1':
+        print(f'PROFILE identity_links_seconds={time.perf_counter()-start:.3f}', file=sys.stderr)
+    with native_event_files(data_dir, identity) as (_, users_path, campaigns_path):
+        yield users_path, campaigns_path

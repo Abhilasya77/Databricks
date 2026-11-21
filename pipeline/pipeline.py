@@ -14,9 +14,10 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 import duckdb
-from first_submission import compute_both
+from first_submission import compute_both, compute_native_jsonl_paths
 
 DATA = Path(os.environ.get('DATA_DIR', '/data'))
 OUT = Path(os.environ.get('OUTPUT_DIR', '/output'))
@@ -48,6 +49,25 @@ def write_table(con, name: str, rows: list[dict]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     parquet = out_dir / 'part-0.parquet'
     typed_empty = ', '.join(f'NULL::{typ} AS "{col}"' for col, typ in schema)
+    if isinstance(rows, (str, Path)):
+        # Read the native engine's existing JSONL directly, never constructing
+        # a Python list or writing a redundant NDJSON copy.
+        native_path = Path(rows)
+        json_schema = ', '.join(
+            f"'{col}': '{'VARCHAR' if typ == 'DATE' else typ}'"
+            for col, typ in schema
+        )
+        select_cols = ', '.join(f'CAST("{col}" AS {typ}) AS "{col}"'
+                                for col, typ in schema)
+        if native_path.stat().st_size == 0:
+            con.execute(f"COPY (SELECT {typed_empty} WHERE FALSE) TO {quote_sql(parquet)} (FORMAT PARQUET)")
+        else:
+            con.execute(f"""COPY (
+                SELECT {select_cols}
+                FROM read_json({quote_sql(native_path)},
+                    format='newline_delimited', columns={{{json_schema}}})
+            ) TO {quote_sql(parquet)} (FORMAT PARQUET)""")
+        return
     if not rows:
         con.execute(f"COPY (SELECT {typed_empty} WHERE FALSE) TO {quote_sql(parquet)} (FORMAT PARQUET)")
         return
@@ -90,15 +110,28 @@ def main():
     con.execute('SET preserve_insertion_order = false')
 
     begin = time.perf_counter()
-    users, campaigns = compute_both(DATA)
-    processed = time.perf_counter()
-    write_table(con, 'user_daily', users)
-    write_table(con, 'campaign_daily', campaigns)
-    finished = time.perf_counter()
-    print(f'Baseline: rows user={len(users)}, campaign={len(campaigns)}, '
-          f'compute={processed-begin:.3f}s, write={finished-processed:.3f}s, '
-          f'total={finished-begin:.3f}s', file=sys.stderr)
-    con.close()
+    try:
+        if os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1':
+            # Retain scratch files until both DuckDB COPY statements complete.
+            with compute_native_jsonl_paths(DATA) as (users_path, campaigns_path):
+                computed = time.perf_counter()
+                write_table(con, 'user_daily', users_path)
+                write_table(con, 'campaign_daily', campaigns_path)
+                finished = time.perf_counter()
+                print(f'Native direct JSONL: compute={computed-begin:.3f}s, '
+                      f'write={finished-computed:.3f}s, total={finished-begin:.3f}s',
+                      file=sys.stderr)
+        else:
+            users, campaigns = compute_both(DATA)
+            processed = time.perf_counter()
+            write_table(con, 'user_daily', users)
+            write_table(con, 'campaign_daily', campaigns)
+            finished = time.perf_counter()
+            print(f'Baseline: rows user={len(users)}, campaign={len(campaigns)}, '
+                  f'compute={processed-begin:.3f}s, write={finished-processed:.3f}s, '
+                  f'total={finished-begin:.3f}s', file=sys.stderr)
+    finally:
+        con.close()
 
 
 if __name__ == '__main__':
