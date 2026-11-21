@@ -1,0 +1,8 @@
+dev/
+out/
+dev-answer/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.env
