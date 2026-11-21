@@ -1,10 +1,21 @@
+from __future__ import annotations
+
 import csv
 import glob
 import os
 import tempfile
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-import duckdb
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import duckdb
+
+# Use the strict, fixture-validated CSV and timestamp routines shared with events.
+if __package__:
+    from .events_sessions import read_strict_csv, parse_timestamp_ms
+else:
+    from events_sessions import read_strict_csv, parse_timestamp_ms
 
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -61,38 +72,18 @@ def build_canonical_map(link_pairs: Iterable[Tuple[str, str]]) -> Dict[str, str]
 
 
 def load_links_from_dir(links_dir: str) -> Dict[str, str]:
-    """Read all CSV files in links/ and build the canonical ID map."""
-    if not os.path.isdir(links_dir):
-        return {}
-    pairs: List[Tuple[str, str]] = []
+    """Build transitive identity map, using the exact challenge CSV dialect."""
+    uf = UnionFind()
     for path in sorted(glob.glob(os.path.join(links_dir, "*.csv"))):
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # skip header
-            for row in reader:
-                if len(row) == 2 and row[0] != "" and row[1] != "":
-                    pairs.append((row[0], row[1]))
-    return build_canonical_map(pairs)
+        for a, b in read_strict_csv(Path(path), 2):
+            if a and b:
+                uf.union(a, b)
+    return {x: uf.min_id[uf.find(x)] for x in uf.parent}
 
 
 def parse_ts_to_ms(ts_str: str) -> Optional[int]:
-    """
-    Strict timestamp parser -> UTC epoch milliseconds.
-    Fast-paths trailing 'Z' to avoid extra timezone conversion overhead.
-    """
-    if not ts_str:
-        return None
-    try:
-        if ts_str[-1] == "Z":
-            dt = datetime.fromisoformat(ts_str[:-1]).replace(tzinfo=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                return None
-            dt = dt.astimezone(timezone.utc)
-        return int(round(dt.timestamp() * 1000))
-    except ValueError:
-        return None
+    """Strict F1/F2/F3 timestamp implementation shared with the event parser."""
+    return parse_timestamp_ms(ts_str)
 
 
 def load_campaigns(campaigns_csv_path: str) -> Dict[str, str]:
@@ -131,18 +122,14 @@ def load_and_clean_clicks(
     get_canonical = canonical_map.get
 
     for path in sorted(glob.glob(os.path.join(clicks_dir, "*.csv"))):
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # skip header
-            for row in reader:
-                if len(row) != 4:
-                    continue
-                click_id, user_id, campaign_id, ts_str = row
+        for click_id, user_id, campaign_id, ts_str in read_strict_csv(Path(path), 4):
 
                 if not click_id or not user_id:
                     continue
                 if click_id in seen_click_ids:
                     continue
+                # Deduplication precedes validation per rules.md.
+                seen_click_ids.add(click_id)
                 if campaign_id not in campaigns:
                     continue
 
@@ -150,7 +137,6 @@ def load_and_clean_clicks(
                 if ts_ms is None or not (min_ts <= ts_ms < window_end_ms):
                     continue
 
-                seen_click_ids.add(click_id)
                 cleaned.append((click_id, get_canonical(user_id, user_id), campaign_id, ts_ms))
 
     return cleaned
@@ -173,10 +159,14 @@ def _bulk_load_clicks(
         """)
         return
 
+    # /tmp is a 64 MB tmpfs in the official read-only container.  Write the
+    # bulk staging file to the disk-backed /scratch mount instead.
+    scratch = Path(os.environ.get("SCRATCH_DIR") or tempfile.gettempdir())
+    scratch.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        "w", suffix=".csv", delete=False, encoding="utf-8", newline=""
+        "w", suffix=".csv", delete=False, encoding="utf-8", newline="", dir=scratch
     ) as tmp:
-        writer = csv.writer(tmp)
+        writer = csv.writer(tmp, lineterminator="\n")
         writer.writerows(cleaned_clicks)
         tmp_path = tmp.name
 
