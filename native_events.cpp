@@ -671,6 +671,21 @@ int main(int argc,char**argv){
         vector<Event> local_grouped;
         vector<size_t> local_ends;
         vector<size_t> local_write;
+        // V66: Isolated integer category/day aggregation (V64 local_pids & PersonEvent untouched)
+        unordered_map<int32_t,string> day_str_cache;
+        auto get_day_str=[&](int32_t dnum, i64 ts)->const string&{
+          auto it=day_str_cache.find(dnum);
+          if(it!=day_str_cache.end())return it->second;
+          return day_str_cache.emplace(dnum,day_string(ts)).first->second;
+        };
+        vector<pair<uint32_t,i64>> cur_cats;
+        vector<pair<uint32_t,i64>> daily_cats;
+        cur_cats.reserve(16);
+        daily_cats.reserve(16);
+        auto add_cat=[](vector<pair<uint32_t,i64>> &v, uint32_t cid, i64 rev){
+          for(auto &kv:v){ if(kv.first==cid){ kv.second+=rev; return; } }
+          v.emplace_back(cid,rev);
+        };
         for(;;){
           const size_t part=next_part.fetch_add(1,memory_order_relaxed);
           if(part>=PERSON_PARTS)break;
@@ -699,56 +714,73 @@ int main(int argc,char**argv){
           local_grouped.resize(local_events.size());
           for(const Event &e:local_events)local_grouped[local_write[e.person]++]=e;
 
-          Session cur;
-          Daily daily;
-          bool have_session=false, have_daily=false;
-          i64 prev=0;
-          uint32_t last_person=UINT32_MAX;
-          auto flush_daily=[&](){
-            if(!have_daily)return;
-            string best;bool has=false;i64 bestsum=0;
-            for(const auto &kv:daily.categories)
-              if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
-                best=kv.first;bestsum=kv.second;has=true;
-              }
-            parquet.write_row(daily.person,native_parquet::parse_date_days(daily.day),
-              daily.sessions,daily.events,daily.revenue,best,!has);
-            ++out.daily_count;
-          };
-          auto flush_session=[&](){
-            if(!have_session)return;
-            ++out.session_count;
-            out.sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
-            if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
-              flush_daily();
-              daily=Daily{cur.person,cur.day};
-              have_daily=true;
-            }
-            daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
-            for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
-          };
           for(size_t pid=0;pid<np;++pid){
             const size_t from=local_ends[pid], to=local_ends[pid+1];
+            if(from==to)continue;
             if(to-from>1)
               sort(local_grouped.begin()+from,local_grouped.begin()+to,
                    [](const Event&a,const Event&b){return a.ts<b.ts;});
             const string person_str(local_people[pid]);
+
+            bool have_session=false, have_daily=false;
+            i64 prev=0, cur_start=0, cur_events=0, cur_rev=0;
+            int32_t cur_day=0, daily_day=0;
+            bool cur_purchased=false;
+            i64 daily_sessions=0, daily_events=0, daily_rev=0;
+            cur_cats.clear();
+            daily_cats.clear();
+
+            auto flush_daily=[&](){
+              if(!have_daily)return;
+              uint32_t best_id=0; bool has=false; i64 bestsum=0;
+              for(const auto &kv:daily_cats){
+                if(!has||kv.second>bestsum||
+                   (kv.second==bestsum&&category_names[kv.first]<category_names[best_id])){
+                  best_id=kv.first; bestsum=kv.second; has=true;
+                }
+              }
+              static const string empty_str;
+              parquet.write_row(person_str, daily_day,
+                daily_sessions, daily_events, daily_rev,
+                has?category_names[best_id]:empty_str, !has);
+              ++out.daily_count;
+              daily_cats.clear();
+            };
+            auto flush_session=[&](){
+              if(!have_session)return;
+              ++out.session_count;
+              out.sessions.push_back(native_campaign::CampaignSession{
+                  person_str, get_day_str(cur_day, cur_start), cur_start, cur_rev, cur_purchased});
+              if(!have_daily||daily_day!=cur_day){
+                flush_daily();
+                daily_day=cur_day;
+                daily_sessions=0; daily_events=0; daily_rev=0;
+                have_daily=true;
+              }
+              ++daily_sessions; daily_events+=cur_events; daily_rev+=cur_rev;
+              for(const auto &c:cur_cats)add_cat(daily_cats, c.first, c.second);
+              cur_cats.clear();
+            };
+
             for(size_t k=from;k<to;++k){
               const Event &e=local_grouped[k];
-              if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+              if(!have_session||e.ts-prev>GAP_MS){
                 flush_session();
-                cur=Session{person_str,day_string(e.ts),e.ts};
+                cur_start=e.ts;
+                cur_day=static_cast<int32_t>(e.ts>=0?(e.ts/DAY_MS):((e.ts-DAY_MS+1)/DAY_MS));
+                cur_events=0; cur_rev=0; cur_purchased=false;
                 have_session=true;
               }
-              ++cur.events;
+              ++cur_events;
               if(e.purchase){
-                cur.purchased=true;cur.revenue+=e.cents;
-                cur.category_revenue[category_names[e.category]]+=e.cents;
+                cur_purchased=true; cur_rev+=e.cents;
+                add_cat(cur_cats, e.category, e.cents);
               }
-              prev=e.ts;last_person=e.person;
+              prev=e.ts;
             }
+            flush_session();
+            flush_daily();
           }
-          flush_session();flush_daily();
         }
         parquet.finish();
       }catch(...){
