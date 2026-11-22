@@ -575,8 +575,7 @@ int main(int argc,char**argv){
   }
   // V67: bounded direct-mapped per-worker cache for raw_user -> (canonical_person, ppart).
   struct CanonicalUserCache {
-    static constexpr size_t SIZE=4096;
-    static constexpr size_t MASK=SIZE-1;
+    enum : size_t { SIZE=4096, MASK=SIZE-1 };
     struct Slot {
       uint64_t raw_hash=0;
       string_view raw_user;
