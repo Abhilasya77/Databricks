@@ -323,8 +323,12 @@ int main(int argc,char**argv){
     Raw raw;
     size_t hash_code;
   };
-  auto read_task=[&](const Task &task){
-    array<vector<Candidate>,SHARD_COUNT> staged;
+  // V47: reuse per-worker shard staging buffers across 8 MiB tasks.
+  // Previously each task allocated and freed up to 128 vectors, even when
+  // the same worker immediately processed another chunk. All staged views
+  // point into read-only mmaps, and are cleared after each shard merge.
+  using StagedBatches = array<vector<Candidate>,SHARD_COUNT>;
+  auto read_task=[&](const Task &task, StagedBatches &staged){
     const MappedFile &f=*task.file;
     const char *const base=f.data;
     const size_t file_end=f.size;
@@ -371,6 +375,7 @@ int main(int argc,char**argv){
           if(candidate_ingest<prev_ingest)prev=c.raw;
         }
       }
+      batch.clear(); // retain capacity for this worker's next task
     }
   };
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
@@ -388,17 +393,19 @@ int main(int argc,char**argv){
   }
   thread_count=min(thread_count,tasks.size());
   if(thread_count==1){
-    for(const auto &task:tasks)read_task(task);
+    StagedBatches staged;
+    for(const auto &task:tasks)read_task(task,staged);
   }else if(thread_count>1){
     atomic<size_t> next{0};
     exception_ptr failure;
     mutex failure_lock;
     auto worker=[&](){
       try{
+        StagedBatches staged; // private to worker; no synchronization needed
         for(;;){
           size_t idx=next.fetch_add(1,memory_order_relaxed);
           if(idx>=tasks.size())break;
-          read_task(tasks[idx]);
+          read_task(tasks[idx],staged);
         }
       }catch(...){
         lock_guard<mutex> guard(failure_lock);
