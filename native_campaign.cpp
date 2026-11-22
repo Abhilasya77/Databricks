@@ -1,20 +1,179 @@
-#include "native_campaign.hpp"
+﻿#include "native_campaign.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string_view>
-#include <unordered_set>
 
 namespace fs = std::filesystem;
 
 namespace native_campaign {
 
 namespace {
+
+inline uint64_t fnv1a_64(std::string_view sv) {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : sv) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+// Flat open-addressing hash map: string_view -> uint32_t (zero heap nodes)
+class FlatSVMap {
+public:
+    void reserve(size_t expected) {
+        size_t cap = 16;
+        while (cap < expected * 2) cap <<= 1;
+        rehash(cap);
+    }
+
+    uint32_t* find(std::string_view key) {
+        if (slots_.empty()) return nullptr;
+        const uint64_t h = fnv1a_64(key);
+        const size_t mask = slots_.size() - 1;
+        size_t idx = static_cast<size_t>(h) & mask;
+        while (true) {
+            Slot& s = slots_[idx];
+            if (s.hash == 0) return nullptr;
+            if (s.hash == h && s.key == key) return &s.val;
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    uint32_t get_or_insert(std::string_view key, uint32_t new_val, bool& inserted) {
+        if ((size_ + 1) * 10 >= slots_.size() * 7) {
+            rehash(slots_.empty() ? 16 : slots_.size() * 2);
+        }
+        const uint64_t h = fnv1a_64(key);
+        const size_t mask = slots_.size() - 1;
+        size_t idx = static_cast<size_t>(h) & mask;
+        while (true) {
+            Slot& s = slots_[idx];
+            if (s.hash == 0) {
+                s.hash = h;
+                s.key = key;
+                s.val = new_val;
+                ++size_;
+                inserted = true;
+                return new_val;
+            }
+            if (s.hash == h && s.key == key) {
+                inserted = false;
+                return s.val;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    size_t size() const { return size_; }
+
+private:
+    struct Slot {
+        uint64_t hash = 0;
+        std::string_view key;
+        uint32_t val = 0;
+    };
+
+    void rehash(size_t new_cap) {
+        std::vector<Slot> next(new_cap);
+        const size_t mask = new_cap - 1;
+        for (const auto& s : slots_) {
+            if (s.hash == 0) continue;
+            size_t idx = static_cast<size_t>(s.hash) & mask;
+            while (next[idx].hash != 0) idx = (idx + 1) & mask;
+            next[idx] = s;
+        }
+        slots_.swap(next);
+    }
+
+    std::vector<Slot> slots_;
+    size_t size_ = 0;
+};
+
+// Flat open-addressing hash set for click_id deduplication backed by a contiguous char arena.
+class FlatClickIdSet {
+public:
+    void reserve(size_t expected_items, size_t expected_bytes) {
+        size_t cap = 64;
+        while (cap < expected_items * 2) cap <<= 1;
+        slots_.assign(cap, Slot{});
+        arena_.reserve(expected_bytes);
+    }
+
+    // Inserts key if unseen; returns true if newly inserted and sets out_off/out_len in arena.
+    bool insert(std::string_view key, uint32_t& out_off, uint32_t& out_len) {
+        if ((size_ + 1) * 10 >= slots_.size() * 7) {
+            rehash(slots_.empty() ? 64 : slots_.size() * 2);
+        }
+        const uint64_t h = fnv1a_64(key);
+        const size_t mask = slots_.size() - 1;
+        size_t idx = static_cast<size_t>(h) & mask;
+        const char* base = arena_.data();
+        while (true) {
+            Slot& s = slots_[idx];
+            if (s.hash == 0) {
+                out_off = static_cast<uint32_t>(arena_.size());
+                out_len = static_cast<uint32_t>(key.size());
+                arena_.insert(arena_.end(), key.data(), key.data() + key.size());
+                s.hash = h;
+                s.off = out_off;
+                s.len = out_len;
+                ++size_;
+                return true;
+            }
+            if (s.hash == h && s.len == key.size() &&
+                std::memcmp(base + s.off, key.data(), s.len) == 0) {
+                return false;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    const char* arena_data() const { return arena_.data(); }
+
+    // Free hash table slots while keeping the arena alive for click_id tie-breaking.
+    void release_table() {
+        slots_.clear();
+        std::vector<Slot>().swap(slots_);
+    }
+
+    void release_all() {
+        release_table();
+        arena_.clear();
+        std::vector<char>().swap(arena_);
+    }
+
+private:
+    struct Slot {
+        uint64_t hash = 0;
+        uint32_t off = 0;
+        uint32_t len = 0;
+    };
+
+    void rehash(size_t new_cap) {
+        std::vector<Slot> next(new_cap);
+        const size_t mask = new_cap - 1;
+        for (const auto& s : slots_) {
+            if (s.hash == 0) continue;
+            size_t idx = static_cast<size_t>(s.hash) & mask;
+            while (next[idx].hash != 0) idx = (idx + 1) & mask;
+            next[idx] = s;
+        }
+        slots_.swap(next);
+    }
+
+    std::vector<Slot> slots_;
+    std::vector<char> arena_;
+    size_t size_ = 0;
+};
 
 inline bool is_leap(int y) {
     return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
@@ -48,124 +207,7 @@ inline bool parse_4digits(const char* p, int& out) {
     return true;
 }
 
-// Strict LF-only CSV: quotes may wrap a whole field but a value may
-// NEVER contain an embedded quote or comma, even escaped as "".
-// This parser returns string_views into the stable input line and does
-// not allocate field strings while parsing.
-bool extract_strict_field_view(
-    std::string_view line,
-    size_t& pos,
-    bool is_last_col,
-    std::string_view& out_view
-) {
-    const size_t n = line.size();
-    if (pos < n && line[pos] == '"') {
-        ++pos;
-        const size_t start = pos;
-        while (pos < n && line[pos] != '"') {
-            if (line[pos] == ',') return false;
-            ++pos;
-        }
-        if (pos == n) return false;
-        out_view = line.substr(start, pos - start);
-        ++pos;  // closing quote
-        if (is_last_col) return pos == n;
-        if (pos >= n || line[pos] != ',') return false;
-        ++pos;
-        return true;
-    }
-
-    const size_t start = pos;
-    while (pos < n && line[pos] != ',') {
-        if (line[pos] == '"') return false;
-        ++pos;
-    }
-    out_view = line.substr(start, pos - start);
-    if (is_last_col) return pos == n;
-    if (pos == n) return false;
-    ++pos;
-    return true;
-}
-
-bool parse_strict_4cols(
-    std::string_view line,
-    std::string_view& c0,
-    std::string_view& c1,
-    std::string_view& c2,
-    std::string_view& c3
-) {
-    size_t pos = 0;
-    if (!extract_strict_field_view(line, pos, false, c0)) return false;
-    if (!extract_strict_field_view(line, pos, false, c1)) return false;
-    if (!extract_strict_field_view(line, pos, false, c2)) return false;
-    if (!extract_strict_field_view(line, pos, true, c3)) return false;
-    return pos == line.size();
-}
-
-void parse_csv_line_any(std::string_view line, std::vector<std::string>& fields) {
-    fields.clear();
-    const size_t n = line.size();
-    size_t i = 0;
-    while (true) {
-        std::string field;
-        if (i < n && line[i] == '"') {
-            ++i;
-            while (i < n) {
-                if (line[i] == '"') {
-                    if (i + 1 < n && line[i + 1] == '"') {
-                        field.push_back('"');
-                        i += 2;
-                    } else {
-                        ++i;
-                        break;
-                    }
-                } else {
-                    field.push_back(line[i++]);
-                }
-            }
-            while (i < n && line[i] != ',') ++i;
-        } else {
-            size_t start = i;
-            while (i < n && line[i] != ',') ++i;
-            field.assign(line.substr(start, i - start));
-        }
-        fields.push_back(std::move(field));
-        if (i == n) break;
-        ++i;
-    }
-}
-
-struct ClickRec {
-    uint32_t person_idx;
-    uint32_t campaign_idx;
-    int64_t ts_ms;
-    std::string click_id;
-};
-
-struct AssistClick {
-    uint32_t person_idx;
-    uint32_t campaign_idx;
-    int64_t ts_ms;
-};
-
-struct SessionRef {
-    uint32_t person_idx;
-    uint32_t day_idx;
-    int64_t start_ms;
-    int64_t revenue_cents;
-    bool has_purchase;
-};
-
-struct AggStats {
-    int64_t sessions = 0;
-    int64_t purchasing_sessions = 0;
-    int64_t revenue_cents = 0;
-    int64_t assisted_sessions = 0;
-};
-
-}  // namespace
-
-bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
+inline bool parse_iso8601_view_to_ms(std::string_view s, int64_t& out_ms) {
     if (s.empty()) return false;
     const size_t n = s.size();
     const char* p = s.data();
@@ -233,6 +275,120 @@ bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
     return true;
 }
 
+// Strict LF-only CSV: quotes may wrap a whole field but a value may
+// NEVER contain an embedded quote or comma, even escaped as "".
+inline bool extract_strict_field_view(
+    std::string_view line,
+    size_t& pos,
+    bool is_last_col,
+    std::string_view& out_view
+) {
+    const size_t n = line.size();
+    if (pos < n && line[pos] == '"') {
+        ++pos;
+        const size_t start = pos;
+        while (pos < n && line[pos] != '"') {
+            if (line[pos] == ',') return false;
+            ++pos;
+        }
+        if (pos == n) return false;
+        out_view = line.substr(start, pos - start);
+        ++pos;
+        if (is_last_col) return pos == n;
+        if (pos >= n || line[pos] != ',') return false;
+        ++pos;
+        return true;
+    }
+
+    const size_t start = pos;
+    while (pos < n && line[pos] != ',') {
+        if (line[pos] == '"') return false;
+        ++pos;
+    }
+    out_view = line.substr(start, pos - start);
+    if (is_last_col) return pos == n;
+    if (pos == n) return false;
+    ++pos;
+    return true;
+}
+
+inline bool parse_strict_4cols(
+    std::string_view line,
+    std::string_view& c0,
+    std::string_view& c1,
+    std::string_view& c2,
+    std::string_view& c3
+) {
+    size_t pos = 0;
+    if (!extract_strict_field_view(line, pos, false, c0)) return false;
+    if (!extract_strict_field_view(line, pos, false, c1)) return false;
+    if (!extract_strict_field_view(line, pos, false, c2)) return false;
+    if (!extract_strict_field_view(line, pos, true, c3)) return false;
+    return pos == line.size();
+}
+
+void parse_csv_line_any(std::string_view line, std::vector<std::string>& fields) {
+    fields.clear();
+    const size_t n = line.size();
+    size_t i = 0;
+    while (true) {
+        std::string field;
+        if (i < n && line[i] == '"') {
+            ++i;
+            while (i < n) {
+                if (line[i] == '"') {
+                    if (i + 1 < n && line[i + 1] == '"') {
+                        field.push_back('"');
+                        i += 2;
+                    } else {
+                        ++i;
+                        break;
+                    }
+                } else {
+                    field.push_back(line[i++]);
+                }
+            }
+            while (i < n && line[i] != ',') ++i;
+        } else {
+            size_t start = i;
+            while (i < n && line[i] != ',') ++i;
+            field.assign(line.substr(start, i - start));
+        }
+        fields.push_back(std::move(field));
+        if (i == n) break;
+        ++i;
+    }
+}
+
+struct ClickRec {
+    uint32_t person_idx;
+    uint32_t campaign_idx;
+    int64_t ts_ms;
+    uint32_t click_id_off;
+    uint32_t click_id_len;
+};
+
+struct SessionRef {
+    uint32_t person_idx;
+    uint32_t day_idx;
+    int64_t start_ms;
+    int64_t revenue_cents;
+    bool has_purchase;
+};
+
+struct AggStats {
+    int64_t sessions = 0;
+    int64_t purchasing_sessions = 0;
+    int64_t revenue_cents = 0;
+    int64_t assisted_sessions = 0;
+};
+
+}  // namespace
+
+bool parse_iso8601_to_ms(const std::string& s, int64_t& out_ms) {
+    return parse_iso8601_view_to_ms(s, out_ms);
+}
+
 std::unordered_map<std::string, std::string> load_campaigns_csv(const std::string& campaigns_csv_path) {
     std::unordered_map<std::string, std::string> campaigns;
     std::ifstream in(campaigns_csv_path, std::ios::binary);
@@ -271,52 +427,50 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
     int64_t window_end_ms,
     const std::vector<CampaignSession>& sessions
 ) {
+    const bool do_profile = (std::getenv("SHOPPING_PROFILE") != nullptr &&
+                             std::strcmp(std::getenv("SHOPPING_PROFILE"), "1") == 0);
+    const auto t_start = std::chrono::steady_clock::now();
+
     const fs::path base(data_dir);
     auto campaigns = load_campaigns_csv((base / "campaigns.csv").string());
 
     std::vector<std::string> campaign_ids;
     std::vector<std::string> campaign_channels;
-    std::unordered_map<std::string, uint32_t> campaign_to_idx;
     campaign_ids.reserve(campaigns.size() + 1);
     campaign_channels.reserve(campaigns.size() + 1);
-    campaign_to_idx.reserve(campaigns.size() + 1);
     campaign_ids.push_back("organic");
     campaign_channels.push_back("organic");
-    campaign_to_idx.emplace("organic", 0u);
 
     for (const auto& kv : campaigns) {
-        uint32_t idx = static_cast<uint32_t>(campaign_ids.size());
         campaign_ids.push_back(kv.first);
         campaign_channels.push_back(kv.second);
-        campaign_to_idx.emplace(kv.first, idx);
     }
 
-    std::unordered_map<std::string, uint32_t> person_to_idx;
+    FlatSVMap campaign_to_idx;
+    campaign_to_idx.reserve(campaign_ids.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(campaign_ids.size()); ++i) {
+        bool ins = false;
+        campaign_to_idx.get_or_insert(campaign_ids[i], i, ins);
+    }
+
+    FlatSVMap person_to_idx;
     person_to_idx.reserve(sessions.size() / 2 + 16);
-    std::unordered_map<std::string, uint32_t> day_to_idx;
+    FlatSVMap day_to_idx;
+    day_to_idx.reserve(64);
     std::vector<std::string> idx_to_day;
+    idx_to_day.reserve(64);
 
     std::vector<SessionRef> srefs;
     srefs.reserve(sessions.size());
     for (const auto& s : sessions) {
-        auto pit = person_to_idx.find(s.person_id);
-        uint32_t pidx;
-        if (pit == person_to_idx.end()) {
-            pidx = static_cast<uint32_t>(person_to_idx.size());
-            person_to_idx.emplace(s.person_id, pidx);
-        } else {
-            pidx = pit->second;
-        }
+        bool ins_p = false;
+        const uint32_t pidx = person_to_idx.get_or_insert(
+            s.person_id, static_cast<uint32_t>(person_to_idx.size()), ins_p);
 
-        auto dit = day_to_idx.find(s.day);
-        uint32_t didx;
-        if (dit == day_to_idx.end()) {
-            didx = static_cast<uint32_t>(idx_to_day.size());
-            day_to_idx.emplace(s.day, didx);
-            idx_to_day.push_back(s.day);
-        } else {
-            didx = dit->second;
-        }
+        bool ins_d = false;
+        const uint32_t didx = day_to_idx.get_or_insert(
+            s.day, static_cast<uint32_t>(idx_to_day.size()), ins_d);
+        if (ins_d) idx_to_day.push_back(s.day);
 
         srefs.push_back(SessionRef{pidx, didx, s.session_start_ms, s.revenue_cents, s.has_purchase});
     }
@@ -326,63 +480,99 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
         return a.start_ms < b.start_ms;
     });
 
+    const auto t_sess = std::chrono::steady_clock::now();
+
     const int64_t min_ts = window_start_ms - SEVEN_DAYS_MS;
-    std::unordered_set<std::string> seen_click_ids;
+    FlatClickIdSet seen_click_ids;
     std::vector<ClickRec> clicks;
 
     const fs::path clicks_dir = base / "clicks";
     if (fs::exists(clicks_dir) && fs::is_directory(clicks_dir)) {
         std::vector<fs::path> click_files;
+        uint64_t total_click_bytes = 0;
         for (const auto& entry : fs::directory_iterator(clicks_dir)) {
             if (entry.is_regular_file() && entry.path().extension() == ".csv") {
                 click_files.push_back(entry.path());
+                std::error_code ec;
+                auto sz = entry.file_size(ec);
+                if (!ec) total_click_bytes += sz;
             }
         }
         std::sort(click_files.begin(), click_files.end(), [](const fs::path& a, const fs::path& b) {
             return a.filename().string() < b.filename().string();
         });
 
-        std::string line;
+        // Estimate ~64 bytes/line to pre-size hash table and arena cleanly
+        const size_t est_clicks = static_cast<size_t>(total_click_bytes / 64) + 64;
+        seen_click_ids.reserve(est_clicks, est_clicks * 16);
+        clicks.reserve(est_clicks / 2 + 64);
+
+        const bool has_canon = !canonical_map.empty();
+        std::string user_buf;
+        std::string file_buf;
 
         for (const auto& file_path : click_files) {
-            std::ifstream in(file_path, std::ios::binary);
+            std::ifstream in(file_path, std::ios::binary | std::ios::ate);
             if (!in) continue;
-            if (!std::getline(in, line)) continue;
+            const std::streamsize fsize = in.tellg();
+            if (fsize <= 0) continue;
+            file_buf.resize(static_cast<size_t>(fsize));
+            in.seekg(0, std::ios::beg);
+            if (!in.read(file_buf.data(), fsize)) continue;
 
-            while (std::getline(in, line)) {
+            const char* p = file_buf.data();
+            const char* end = p + fsize;
+
+            // Skip header line
+            const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+            if (!nl) continue;
+            p = nl + 1;
+
+            while (p < end) {
+                nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+                const char* line_end = nl ? nl : end;
+                const size_t line_len = static_cast<size_t>(line_end - p);
+                std::string_view line(p, line_len);
+                p = nl ? (nl + 1) : end;
+
                 if (line.empty()) continue;
                 std::string_view c0, c1, c2, c3;
                 if (!parse_strict_4cols(line, c0, c1, c2, c3)) continue;
 
                 // Deduplicate first before validation per pipeline rules
                 if (c0.empty()) continue;
-                std::string click_id_str(c0);
-                if (!seen_click_ids.insert(click_id_str).second) continue;
+                uint32_t cid_off = 0, cid_len = 0;
+                if (!seen_click_ids.insert(c0, cid_off, cid_len)) continue;
 
                 if (c1.empty()) continue;
 
-                auto cit = campaign_to_idx.find(std::string(c2));
-                if (cit == campaign_to_idx.end() || cit->second == 0) continue;
+                uint32_t* cit = campaign_to_idx.find(c2);
+                if (!cit || *cit == 0) continue;
 
                 int64_t ts_ms = 0;
-                if (!parse_iso8601_to_ms(std::string(c3), ts_ms)) continue;
+                if (!parse_iso8601_view_to_ms(c3, ts_ms)) continue;
                 if (ts_ms < min_ts || ts_ms >= window_end_ms) continue;
 
-                std::string user_str(c1);
-                auto mit = canonical_map.find(user_str);
-                const std::string& person_id = (mit != canonical_map.end()) ? mit->second : user_str;
+                std::string_view person_sv = c1;
+                if (has_canon) {
+                    user_buf.assign(c1.data(), c1.size());
+                    auto mit = canonical_map.find(user_buf);
+                    if (mit != canonical_map.end()) {
+                        person_sv = mit->second;
+                    }
+                }
 
-                auto pit = person_to_idx.find(person_id);
-                if (pit == person_to_idx.end()) continue;
+                uint32_t* pit = person_to_idx.find(person_sv);
+                if (!pit) continue;
 
-                clicks.push_back(ClickRec{pit->second, cit->second, ts_ms, std::move(click_id_str)});
+                clicks.push_back(ClickRec{*pit, *cit, ts_ms, cid_off, cid_len});
             }
         }
     }
 
-    // Free seen_click_ids before sorting to keep peak memory low
-    seen_click_ids.clear();
-    std::unordered_set<std::string>().swap(seen_click_ids);
+    // Free hash table slots immediately; arena stays alive for click_id tie-breaking during sort
+    seen_click_ids.release_table();
+    const auto t_clicks = std::chrono::steady_clock::now();
 
     const size_t num_campaigns = campaign_ids.size();
     const size_t num_days = idx_to_day.size();
@@ -395,13 +585,22 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
         st.revenue_cents += s.revenue_cents;
     };
 
-    // Sort by (person_idx, ts_ms, click_id) so first click at each ts_ms has bytewise smallest click_id
-    std::sort(clicks.begin(), clicks.end(), [](const ClickRec& a, const ClickRec& b) {
+    const char* arena_base = seen_click_ids.arena_data();
+    std::sort(clicks.begin(), clicks.end(), [arena_base](const ClickRec& a, const ClickRec& b) {
         if (a.person_idx != b.person_idx) return a.person_idx < b.person_idx;
         if (a.ts_ms != b.ts_ms) return a.ts_ms < b.ts_ms;
-        return a.click_id < b.click_id;
+        const uint32_t min_len = a.click_id_len < b.click_id_len ? a.click_id_len : b.click_id_len;
+        const int cmp = std::memcmp(arena_base + a.click_id_off, arena_base + b.click_id_off, min_len);
+        if (cmp != 0) return cmp < 0;
+        return a.click_id_len < b.click_id_len;
     });
 
+    // Arena is no longer needed once click_id tie-break order is established
+    seen_click_ids.release_all();
+    const auto t_sort = std::chrono::steady_clock::now();
+
+    // Single pass per person: compute last-click attribution AND interval-merged assists
+    // while srefs[si..s_end) and clicks[c_start..c_end) are hot in L1 cache.
     size_t si = 0, ci = 0;
     const size_t sn = srefs.size(), cn = clicks.size();
 
@@ -411,13 +610,14 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
         while (s_end < sn && srefs[s_end].person_idx == pidx) ++s_end;
 
         while (ci < cn && clicks[ci].person_idx < pidx) ++ci;
-        size_t c_start = ci;
+        const size_t c_start = ci;
         while (ci < cn && clicks[ci].person_idx == pidx) ++ci;
-        size_t c_end = ci;
+        const size_t c_end = ci;
 
         if (c_start == c_end) {
             for (size_t i = si; i < s_end; ++i) add_attributed(0, srefs[i]);
         } else {
+            // 1. Last-click attribution
             size_t c_ptr = c_start;
             int64_t best_ts = -1;
             uint32_t best_camp = 0;
@@ -439,66 +639,53 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
                     add_attributed(0, srefs[i]);
                 }
             }
-        }
-        si = s_end;
-    }
 
-    // Build compact POD assist records without click_id strings and release clicks memory
-    std::vector<AssistClick> assist_clicks;
-    assist_clicks.reserve(cn);
-    for (const auto& c : clicks) {
-        assist_clicks.push_back(AssistClick{c.person_idx, c.campaign_idx, c.ts_ms});
-    }
-    clicks.clear();
-    std::vector<ClickRec>().swap(clicks);
+            // 2. Assisted sessions: sort only this person's click slice by (campaign_idx, ts_ms)
+            if (c_end - c_start > 1) {
+                std::sort(clicks.begin() + static_cast<std::ptrdiff_t>(c_start),
+                          clicks.begin() + static_cast<std::ptrdiff_t>(c_end),
+                          [](const ClickRec& a, const ClickRec& b) {
+                              if (a.campaign_idx != b.campaign_idx) return a.campaign_idx < b.campaign_idx;
+                              return a.ts_ms < b.ts_ms;
+                          });
+            }
 
-    std::sort(assist_clicks.begin(), assist_clicks.end(), [](const AssistClick& a, const AssistClick& b) {
-        if (a.person_idx != b.person_idx) return a.person_idx < b.person_idx;
-        if (a.campaign_idx != b.campaign_idx) return a.campaign_idx < b.campaign_idx;
-        return a.ts_ms < b.ts_ms;
-    });
+            size_t ac = c_start;
+            while (ac < c_end) {
+                const uint32_t cidx = clicks[ac].campaign_idx;
+                const size_t camp_offset = static_cast<size_t>(cidx) * num_days;
+                size_t s_ptr = si;
 
-    si = 0;
-    ci = 0;
-    const size_t acn = assist_clicks.size();
-    while (si < sn && ci < acn) {
-        const uint32_t pidx = srefs[si].person_idx;
-        size_t s_end = si + 1;
-        while (s_end < sn && srefs[s_end].person_idx == pidx) ++s_end;
+                int64_t iv_start = clicks[ac].ts_ms;
+                int64_t iv_end = iv_start + SEVEN_DAYS_MS;
+                ++ac;
 
-        while (ci < acn && assist_clicks[ci].person_idx < pidx) ++ci;
-        while (ci < acn && assist_clicks[ci].person_idx == pidx) {
-            const uint32_t cidx = assist_clicks[ci].campaign_idx;
-            const size_t camp_offset = static_cast<size_t>(cidx) * num_days;
-            size_t s_ptr = si;
-
-            int64_t iv_start = assist_clicks[ci].ts_ms;
-            int64_t iv_end = iv_start + SEVEN_DAYS_MS;
-            ++ci;
-
-            while (ci < acn && assist_clicks[ci].person_idx == pidx && assist_clicks[ci].campaign_idx == cidx) {
-                const int64_t t = assist_clicks[ci].ts_ms;
-                if (t <= iv_end) {
-                    iv_end = t + SEVEN_DAYS_MS;
-                } else {
-                    while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
-                    while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
-                        agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
-                        ++s_ptr;
+                while (ac < c_end && clicks[ac].campaign_idx == cidx) {
+                    const int64_t t = clicks[ac].ts_ms;
+                    if (t <= iv_end) {
+                        iv_end = t + SEVEN_DAYS_MS;
+                    } else {
+                        while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
+                        while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
+                            agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
+                            ++s_ptr;
+                        }
+                        iv_start = t;
+                        iv_end = t + SEVEN_DAYS_MS;
                     }
-                    iv_start = t;
-                    iv_end = t + SEVEN_DAYS_MS;
+                    ++ac;
                 }
-                ++ci;
-            }
-            while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
-            while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
-                agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
-                ++s_ptr;
+                while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
+                while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
+                    agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
+                    ++s_ptr;
+                }
             }
         }
         si = s_end;
     }
+
+    const auto t_attrib = std::chrono::steady_clock::now();
 
     std::vector<CampaignDailyRow> result;
     for (size_t c = 0; c < num_campaigns; ++c) {
@@ -522,6 +709,16 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
         if (a.campaign_id != b.campaign_id) return a.campaign_id < b.campaign_id;
         return a.day < b.day;
     });
+
+    if (do_profile) {
+        const auto t_end = std::chrono::steady_clock::now();
+        auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        std::cerr << "PROFILE campaign_index_sessions_seconds=" << sec(t_start, t_sess) << "\n"
+                  << "PROFILE campaign_load_clicks_seconds=" << sec(t_sess, t_clicks) << "\n"
+                  << "PROFILE campaign_sort_clicks_seconds=" << sec(t_clicks, t_sort) << "\n"
+                  << "PROFILE campaign_attrib_assist_seconds=" << sec(t_sort, t_attrib) << "\n"
+                  << "PROFILE campaign_total_seconds=" << sec(t_start, t_end) << "\n";
+    }
 
     return result;
 }
@@ -588,5 +785,3 @@ int main(int argc, char** argv) {
     return 0;
 }
 #endif
-
-

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Shopping Sessions: first complete correctness-first submission candidate.
 
 Standalone fallback integration until the teammate's implementation is ready.
@@ -14,7 +14,6 @@ import json
 import os
 import sys
 import time
-from contextlib import nullcontext
 
 import duckdb
 from first_submission import compute_both, compute_native_jsonl_paths
@@ -50,26 +49,26 @@ def write_table(con, name: str, rows: list[dict]) -> None:
     parquet = out_dir / 'part-0.parquet'
     typed_empty = ', '.join(f'NULL::{typ} AS "{col}"' for col, typ in schema)
     if isinstance(rows, (str, Path)):
-        # Read the native engine's existing JSONL directly, never constructing
-        # a Python list or writing a redundant NDJSON copy.
         native_path = Path(rows)
-        json_schema = ', '.join(
-            f"'{col}': '{'VARCHAR' if typ == 'DATE' else typ}'"
-            for col, typ in schema
-        )
-        select_cols = ', '.join(f'CAST("{col}" AS {typ}) AS "{col}"'
-                                for col, typ in schema)
         if native_path.stat().st_size == 0:
-            con.execute(f"COPY (SELECT {typed_empty} WHERE FALSE) TO {quote_sql(parquet)} (FORMAT PARQUET)")
+            con.execute(
+                f"COPY (SELECT {typed_empty} WHERE FALSE) "
+                f"TO {quote_sql(parquet)} (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)"
+            )
         else:
+            # Parse DATE and numeric types directly in read_json to skip extra CAST projection
+            json_schema = ', '.join(f"'{col}': '{typ}'" for col, typ in schema)
             con.execute(f"""COPY (
-                SELECT {select_cols}
+                SELECT *
                 FROM read_json({quote_sql(native_path)},
-                    format='newline_delimited', columns={{{json_schema}}})
-            ) TO {quote_sql(parquet)} (FORMAT PARQUET)""")
+                    format='newline_delimited', auto_detect=false, columns={{{json_schema}}})
+            ) TO {quote_sql(parquet)} (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)""")
         return
     if not rows:
-        con.execute(f"COPY (SELECT {typed_empty} WHERE FALSE) TO {quote_sql(parquet)} (FORMAT PARQUET)")
+        con.execute(
+            f"COPY (SELECT {typed_empty} WHERE FALSE) "
+            f"TO {quote_sql(parquet)} (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)"
+        )
         return
 
     ndjson = SCRATCH / (name + '.ndjson')
@@ -79,20 +78,15 @@ def write_table(con, name: str, rows: list[dict]) -> None:
                          for k, v in row.items()}
             f.write(json.dumps(converted, ensure_ascii=False, separators=(',', ':')) + '\n')
 
-    json_schema = ', '.join(
-        f"'{col}': '{'VARCHAR' if typ == 'DATE' else typ}'"
-        for col, typ in schema
-    )
-    select_cols = ', '.join(f'CAST("{col}" AS {typ}) AS "{col}"'
-                            for col, typ in schema)
+    json_schema = ', '.join(f"'{col}': '{typ}'" for col, typ in schema)
     query = f"""
         COPY (
-            SELECT {select_cols}
+            SELECT *
             FROM read_json(
                 {quote_sql(ndjson)}, format='newline_delimited',
-                columns={{{json_schema}}}
+                auto_detect=false, columns={{{json_schema}}}
             )
-        ) TO {quote_sql(parquet)} (FORMAT PARQUET)
+        ) TO {quote_sql(parquet)} (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)
     """
     try:
         con.execute(query)
@@ -112,7 +106,6 @@ def main():
     begin = time.perf_counter()
     try:
         if os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1':
-            # Retain scratch files until both DuckDB COPY statements complete.
             with compute_native_jsonl_paths(DATA) as (users_path, campaigns_path):
                 computed = time.perf_counter()
                 write_table(con, 'user_daily', users_path)
