@@ -584,11 +584,42 @@ int main(int argc,char**argv){
     vector<Event> grouped(events.size());
     for(const Event &e:events)grouped[write_pos[e.person]++]=e;
     events.swap(grouped);
-    for(size_t i=0;i<sorted_people.size();++i){
-      const size_t from=ends[i], to=ends[i+1];
-      if(to-from>1)
-        sort(events.begin()+from,events.begin()+to,
-             [](const Event&a,const Event&b){return a.ts<b.ts;});
+    // V46: person ranges are independent; sort their timestamps concurrently.
+    // Each worker touches disjoint spans, so neither locks nor a merge are needed.
+    // Preserve std::sort comparator and per-person grouping semantics.
+    auto sort_people_range=[&](size_t from_person,size_t to_person){
+      for(size_t i=from_person;i<to_person;++i){
+        const size_t from=ends[i], to=ends[i+1];
+        if(to-from>1)
+          sort(events.begin()+from,events.begin()+to,
+               [](const Event&a,const Event&b){return a.ts<b.ts;});
+      }
+    };
+    if(thread_count>1 && events.size()>=200000 && sorted_people.size()>=1000){
+      // Dynamic batches avoid imbalanced work when some people have many events.
+      constexpr size_t PERSON_BATCH=256;
+      atomic<size_t> next_person{0};
+      exception_ptr failure;
+      mutex failure_lock;
+      auto sort_worker=[&](){
+        try{
+          for(;;){
+            const size_t from=next_person.fetch_add(PERSON_BATCH,memory_order_relaxed);
+            if(from>=sorted_people.size())break;
+            sort_people_range(from,min(from+PERSON_BATCH,sorted_people.size()));
+          }
+        }catch(...){
+          lock_guard<mutex> guard(failure_lock);
+          if(!failure)failure=current_exception();
+        }
+      };
+      vector<thread> workers;
+      workers.reserve(thread_count);
+      for(size_t i=0;i<thread_count;++i)workers.emplace_back(sort_worker);
+      for(auto &t:workers)t.join();
+      if(failure)rethrow_exception(failure);
+    }else{
+      sort_people_range(0,sorted_people.size());
     }
   }
   profile("event_sort");
