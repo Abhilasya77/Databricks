@@ -271,6 +271,17 @@ int main(int argc,char**argv){
   unordered_map<string_view,string_view> product_lookup;
   product_lookup.reserve(categories.size());
   for(const auto &kv:categories)product_lookup.emplace(string_view(kv.first),string_view(kv.second));
+  unordered_map<string,uint32_t> category_ids;
+  vector<string> category_names;
+  auto category_number=[&](const string &name)->uint32_t{
+    auto [it,inserted]=category_ids.try_emplace(name,static_cast<uint32_t>(category_names.size()));
+    if(inserted)category_names.push_back(name);
+    return it->second;
+  };
+  const uint32_t unknown_cat_id=category_number("unknown");
+  unordered_map<string_view,uint32_t> product_cat_id;
+  product_cat_id.reserve(product_lookup.size()*2+16);
+  for(const auto &kv:product_lookup)product_cat_id.emplace(kv.first,category_number(string(kv.second)));
   profile("metadata_and_identity");
   // Store one compact raw line per event_id instead of six separate strings.
   // Dedup still precedes validation (including late/invalid timestamps).
@@ -326,13 +337,27 @@ int main(int argc,char**argv){
   //    open-addressed table (preserving exact smallest lexicographic ingest_ts),
   //    and immediately validates winners into parsed[part].
   constexpr size_t SHARD_COUNT=64;
+  // V68: 40-byte fused row (+8B over V64's 32B) carrying pre-validated fields
+  // from Phase 1's sequential mmap scan to eliminate Phase 2's second CSV parse
+  // and random mmap re-reads. Legacy mode stores line_len in ts with fast_fused=0.
   struct CompactRow {
     const char *line_ptr;
-    uint32_t line_len;
-    uint16_t id_off, id_len;
-    uint16_t ing_off, ing_len;
     uint64_t hash_code;
+    i64 ts;
+    uint32_t cents_flags; // bits 0..23: cents, 24: valid, 25: purchase, 26: fast_fused, 27: id_off_is_1
+    uint16_t id_len;
+    uint16_t ing_off;
+    uint16_t ing_len;
+    uint16_t user_off;
+    uint16_t user_len;
+    uint16_t cat_id;
+    uint16_t id_off() const { return static_cast<uint16_t>((cents_flags >> 27) & 1U); }
+    bool valid() const { return (cents_flags & (1U << 24)) != 0; }
+    bool purchase() const { return (cents_flags & (1U << 25)) != 0; }
+    bool fast_fused() const { return (cents_flags & (1U << 26)) != 0; }
+    i64 cents() const { return static_cast<i64>(cents_flags & 0x00FFFFFFU); }
   };
+  static_assert(sizeof(CompactRow) == 40, "CompactRow must stay 40 bytes");
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
   if(const char* cpus=getenv("NCPU")){
     char *stop=nullptr;
@@ -378,13 +403,64 @@ int main(int argc,char**argv){
       const string_view line(base+start,stop-start);
       if(parse_event_views(line,fields)&&!fields[0].empty()){
         const uint64_t h=fast_hash_sv(fields[0]);
-        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-line.data());
+        const uint32_t id_off_bit=static_cast<uint32_t>((fields[0].data()-line.data())!=0)<<27;
         const uint16_t id_len=static_cast<uint16_t>(fields[0].size());
         const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-line.data());
         const uint16_t ing_len=static_cast<uint16_t>(fields[3].size());
-        local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
-            line.data(), static_cast<uint32_t>(line.size()),
-            id_off, id_len, ing_off, ing_len, h});
+        if(direct_parquet){
+          const string_view user=fields[1], tsstr=fields[2],
+                            event_type=fields[4], product=fields[5], price=fields[6];
+          bool is_valid=false, is_purchase=false;
+          i64 ts=0, cents=0;
+          uint32_t cat_id=0;
+          if(!user.empty()&&!product.empty()&&
+             (event_type=="view"||event_type=="cart"||event_type=="purchase")){
+            i64 ingest=0;
+            if(parse_ts(tsstr,ts)&&ts>=lo&&ts<hi&&parse_ts(fields[3],ingest)&&ingest-ts<=DAY_MS){
+              is_purchase=(event_type=="purchase");
+              if(is_purchase){
+                if(!price.empty()){
+                  bool valid_price=true;
+                  for(char c:price){
+                    const unsigned digit=static_cast<unsigned char>(c)-'0';
+                    if(digit>9 || cents>10000000/10){valid_price=false;break;}
+                    cents=cents*10+digit;
+                    if(cents>10000000){valid_price=false;break;}
+                  }
+                  if(valid_price && cents>=1){
+                    auto cit=product_cat_id.find(product);
+                    cat_id=(cit==product_cat_id.end())?unknown_cat_id:cit->second;
+                    is_valid=true;
+                  }
+                }
+              }else{
+                is_valid=true;
+              }
+            }
+          }
+          const size_t uoff=static_cast<size_t>(user.data()-line.data());
+          const size_t ulen=user.size();
+          if(!is_valid || (uoff<=65535 && ulen<=65535 && cat_id<=65535)){
+            const uint32_t flags=static_cast<uint32_t>(cents)
+                |(is_valid?(1U<<24):0U)
+                |(is_purchase?(1U<<25):0U)
+                |(1U<<26)
+                |id_off_bit;
+            local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+                line.data(), h, ts, flags, id_len, ing_off, ing_len,
+                static_cast<uint16_t>(is_valid?uoff:0),
+                static_cast<uint16_t>(is_valid?ulen:0),
+                static_cast<uint16_t>(cat_id)});
+          }else{
+            local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+                line.data(), h, static_cast<i64>(line.size()), id_off_bit,
+                id_len, ing_off, ing_len, 0, 0, 0});
+          }
+        }else{
+          local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+              line.data(), h, static_cast<i64>(line.size()), id_off_bit,
+              id_len, ing_off, ing_len, 0, 0, 0});
+        }
       }
       start=stop+static_cast<size_t>(!!lf);
     }
@@ -485,19 +561,8 @@ int main(int argc,char**argv){
   // The cap keeps the up-front allocation bounded on very large inputs.
   raw_user_cache.reserve(min<size_t>(n_raw / 4, 5000000));
   vector<string> people;
-  unordered_map<string,uint32_t> category_ids;
-  // Purchase product IDs are also repeated; resolve their category only once.
+  // Purchase product IDs are also repeated; resolve their category only once (legacy path).
   unordered_map<string_view,uint32_t> product_category_cache;
-  vector<string> category_names;
-  auto category_number=[&](const string &name)->uint32_t{
-    auto [it,inserted]=category_ids.try_emplace(name,static_cast<uint32_t>(category_names.size()));
-    if(inserted)category_names.push_back(name);
-    return it->second;
-  };
-  const uint32_t unknown_cat_id=category_number("unknown");
-  unordered_map<string_view,uint32_t> product_cat_id;
-  product_cat_id.reserve(product_lookup.size()*2+16);
-  for(const auto &kv:product_lookup)product_cat_id.emplace(kv.first,category_number(string(kv.second)));
   // V22: parse and validate each disjoint dedup shard in parallel.
   // Borrow string_views from Raw rows until after all users/categories are
   // interned. Consume shard results in baseline order for deterministic output.
@@ -532,12 +597,12 @@ int main(int argc,char**argv){
       if((winners.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
       const size_t mask=slots.size()-1;
       size_t pos=(c.hash_code>>6)&mask;
-      const string_view cid(c.line_ptr+c.id_off,c.id_len);
+      const string_view cid(c.line_ptr+c.id_off(),c.id_len);
       while(uint32_t s=slots[pos]){
         CompactRow &w=winners[s-1];
         if(w.hash_code==c.hash_code &&
            w.id_len==c.id_len &&
-           memcmp(w.line_ptr+w.id_off,cid.data(),c.id_len)==0){
+           memcmp(w.line_ptr+w.id_off(),cid.data(),c.id_len)==0){
           const string_view prev_ing(w.line_ptr+w.ing_off,w.ing_len);
           const string_view cand_ing(c.line_ptr+c.ing_off,c.ing_len);
           if(cand_ing<prev_ing)w=c;
@@ -579,7 +644,17 @@ int main(int argc,char**argv){
     if(out_parsed)out_parsed->reserve(tbl.winners.size());
     array<string_view,7> columns;
     for(const CompactRow &r:tbl.winners){
-      const string_view line(r.line_ptr,r.line_len);
+      if(direct_parquet && r.fast_fused()){
+        if(!r.valid())continue;
+        const string_view user(r.line_ptr+r.user_off,r.user_len);
+        auto id=identity_lookup.find(user);
+        const string_view person=(id==identity_lookup.end())?user:id->second;
+        const size_t ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
+        person_buckets[worker_tid][ppart].push_back(
+            PersonEvent{r.ts,r.cents(),person,static_cast<uint32_t>(r.cat_id),r.purchase()});
+        continue;
+      }
+      const string_view line(r.line_ptr,static_cast<size_t>(r.ts));
       if(!parse_event_views(line,columns))throw runtime_error("internal CSV invariant");
       const string_view user=columns[1], tsstr=columns[2],
                         event_type=columns[4], product=columns[5], price=columns[6];
