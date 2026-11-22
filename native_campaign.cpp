@@ -1,6 +1,7 @@
 ﻿#include "native_campaign.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <climits>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <string_view>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -35,13 +37,13 @@ public:
         rehash(cap);
     }
 
-    uint32_t* find(std::string_view key) {
+    const uint32_t* find(std::string_view key) const {
         if (slots_.empty()) return nullptr;
         const uint64_t h = fnv1a_64(key);
         const size_t mask = slots_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         while (true) {
-            Slot& s = slots_[idx];
+            const Slot& s = slots_[idx];
             if (s.hash == 0) return nullptr;
             if (s.hash == h && s.key == key) return &s.val;
             idx = (idx + 1) & mask;
@@ -108,12 +110,11 @@ public:
         arena_.reserve(expected_bytes);
     }
 
-    // Inserts key if unseen; returns true if newly inserted and sets out_off/out_len in arena.
-    bool insert(std::string_view key, uint32_t& out_off, uint32_t& out_len) {
+    // Inserts key using precomputed hash h; returns true if newly inserted.
+    bool insert_with_hash(std::string_view key, uint64_t h, uint32_t& out_off, uint32_t& out_len) {
         if ((size_ + 1) * 10 >= slots_.size() * 7) {
             rehash(slots_.empty() ? 64 : slots_.size() * 2);
         }
-        const uint64_t h = fnv1a_64(key);
         const size_t mask = slots_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         const char* base = arena_.data();
@@ -139,7 +140,6 @@ public:
 
     const char* arena_data() const { return arena_.data(); }
 
-    // Free hash table slots while keeping the arena alive for click_id tie-breaking.
     void release_table() {
         slots_.clear();
         std::vector<Slot>().swap(slots_);
@@ -275,8 +275,6 @@ inline bool parse_iso8601_view_to_ms(std::string_view s, int64_t& out_ms) {
     return true;
 }
 
-// Strict LF-only CSV: quotes may wrap a whole field but a value may
-// NEVER contain an embedded quote or comma, even escaped as "".
 inline bool extract_strict_field_view(
     std::string_view line,
     size_t& pos,
@@ -360,6 +358,21 @@ void parse_csv_line_any(std::string_view line, std::vector<std::string>& fields)
     }
 }
 
+struct ParsedClickRow {
+    uint64_t cid_hash;
+    uint32_t cid_off;
+    uint32_t cid_len;
+    uint32_t person_idx;
+    uint32_t campaign_idx;
+    int64_t ts_ms;
+    uint8_t valid;
+};
+
+struct ParsedClickFile {
+    std::string file_buf;
+    std::vector<ParsedClickRow> rows;
+};
+
 struct ClickRec {
     uint32_t person_idx;
     uint32_t campaign_idx;
@@ -382,6 +395,18 @@ struct AggStats {
     int64_t revenue_cents = 0;
     int64_t assisted_sessions = 0;
 };
+
+size_t get_worker_count(size_t num_files) {
+    if (num_files <= 1) return 1;
+    unsigned hw = std::thread::hardware_concurrency();
+    size_t n = hw ? static_cast<size_t>(hw) : 4;
+    if (const char* env = std::getenv("NCPU")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) n = static_cast<size_t>(parsed);
+    }
+    if (n > 8) n = 8;
+    return std::min(n, num_files);
+}
 
 }  // namespace
 
@@ -453,38 +478,87 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
         campaign_to_idx.get_or_insert(campaign_ids[i], i, ins);
     }
 
+    // Reserve generously to avoid rehashes on high-cardinality datasets
     FlatSVMap person_to_idx;
-    person_to_idx.reserve(sessions.size() / 2 + 16);
+    person_to_idx.reserve(sessions.size() + canonical_map.size() + 16);
     FlatSVMap day_to_idx;
     day_to_idx.reserve(64);
     std::vector<std::string> idx_to_day;
     idx_to_day.reserve(64);
 
-    std::vector<SessionRef> srefs;
-    srefs.reserve(sessions.size());
+    std::vector<SessionRef> raw_srefs;
+    raw_srefs.reserve(sessions.size());
+    std::vector<uint32_t> person_sess_counts;
+    person_sess_counts.reserve(sessions.size() / 2 + 16);
+
+    std::string_view last_day;
+    uint32_t last_didx = 0;
+    bool has_last_day = false;
+
     for (const auto& s : sessions) {
         bool ins_p = false;
         const uint32_t pidx = person_to_idx.get_or_insert(
-            s.person_id, static_cast<uint32_t>(person_to_idx.size()), ins_p);
+            s.person_id, static_cast<uint32_t>(person_sess_counts.size()), ins_p);
+        if (ins_p) person_sess_counts.push_back(1);
+        else person_sess_counts[pidx] += 1;
 
-        bool ins_d = false;
-        const uint32_t didx = day_to_idx.get_or_insert(
-            s.day, static_cast<uint32_t>(idx_to_day.size()), ins_d);
-        if (ins_d) idx_to_day.push_back(s.day);
+        uint32_t didx = 0;
+        if (has_last_day && s.day == last_day) {
+            didx = last_didx;
+        } else {
+            bool ins_d = false;
+            didx = day_to_idx.get_or_insert(
+                s.day, static_cast<uint32_t>(idx_to_day.size()), ins_d);
+            if (ins_d) idx_to_day.push_back(s.day);
+            last_day = idx_to_day[didx];
+            last_didx = didx;
+            has_last_day = true;
+        }
 
-        srefs.push_back(SessionRef{pidx, didx, s.session_start_ms, s.revenue_cents, s.has_purchase});
+        raw_srefs.push_back(SessionRef{pidx, didx, s.session_start_ms, s.revenue_cents, s.has_purchase});
     }
 
-    std::sort(srefs.begin(), srefs.end(), [](const SessionRef& a, const SessionRef& b) {
-        if (a.person_idx != b.person_idx) return a.person_idx < b.person_idx;
-        return a.start_ms < b.start_ms;
-    });
+    const uint32_t num_persons = static_cast<uint32_t>(person_sess_counts.size());
+
+    // O(N) counting sort of sessions by person_idx, then sort only each person's small slice by start_ms
+    std::vector<uint32_t> person_sess_offsets(num_persons + 1, 0);
+    for (uint32_t p = 0; p < num_persons; ++p) {
+        person_sess_offsets[p + 1] = person_sess_offsets[p] + person_sess_counts[p];
+    }
+
+    std::vector<SessionRef> srefs(raw_srefs.size());
+    std::vector<uint32_t> write_pos = person_sess_offsets;
+    for (const auto& sr : raw_srefs) {
+        srefs[write_pos[sr.person_idx]++] = sr;
+    }
+    raw_srefs.clear();
+    std::vector<SessionRef>().swap(raw_srefs);
+
+    for (uint32_t p = 0; p < num_persons; ++p) {
+        const uint32_t b = person_sess_offsets[p];
+        const uint32_t e = person_sess_offsets[p + 1];
+        if (e - b > 1) {
+            std::sort(srefs.begin() + b, srefs.begin() + e, [](const SessionRef& a, const SessionRef& b) {
+                return a.start_ms < b.start_ms;
+            });
+        }
+    }
+
+    // Fold canonical_map aliases directly into person_to_idx for single-probe click resolution
+    for (const auto& kv : canonical_map) {
+        const uint32_t* pit = person_to_idx.find(kv.second);
+        if (pit) {
+            bool ins = false;
+            person_to_idx.get_or_insert(kv.first, *pit, ins);
+        }
+    }
 
     const auto t_sess = std::chrono::steady_clock::now();
 
     const int64_t min_ts = window_start_ms - SEVEN_DAYS_MS;
     FlatClickIdSet seen_click_ids;
-    std::vector<ClickRec> clicks;
+    std::vector<ClickRec> raw_clicks;
+    std::vector<uint32_t> person_click_counts(num_persons, 0);
 
     const fs::path clicks_dir = base / "clicks";
     if (fs::exists(clicks_dir) && fs::is_directory(clicks_dir)) {
@@ -502,77 +576,130 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             return a.filename().string() < b.filename().string();
         });
 
-        // Estimate ~64 bytes/line to pre-size hash table and arena cleanly
-        const size_t est_clicks = static_cast<size_t>(total_click_bytes / 64) + 64;
-        seen_click_ids.reserve(est_clicks, est_clicks * 16);
-        clicks.reserve(est_clicks / 2 + 64);
+        const size_t num_files = click_files.size();
+        std::vector<ParsedClickFile> parsed_files(num_files);
 
-        const bool has_canon = !canonical_map.empty();
-        std::string user_buf;
-        std::string file_buf;
-
-        for (const auto& file_path : click_files) {
-            std::ifstream in(file_path, std::ios::binary | std::ios::ate);
-            if (!in) continue;
+        auto parse_one_file = [&](size_t fidx) {
+            ParsedClickFile& pf = parsed_files[fidx];
+            std::ifstream in(click_files[fidx], std::ios::binary | std::ios::ate);
+            if (!in) return;
             const std::streamsize fsize = in.tellg();
-            if (fsize <= 0) continue;
-            file_buf.resize(static_cast<size_t>(fsize));
+            if (fsize <= 0) return;
+            pf.file_buf.resize(static_cast<size_t>(fsize));
             in.seekg(0, std::ios::beg);
-            if (!in.read(file_buf.data(), fsize)) continue;
+            if (!in.read(pf.file_buf.data(), fsize)) {
+                pf.file_buf.clear();
+                return;
+            }
 
-            const char* p = file_buf.data();
+            pf.rows.reserve(static_cast<size_t>(fsize / 64) + 16);
+            const char* base_ptr = pf.file_buf.data();
+            const char* p = base_ptr;
             const char* end = p + fsize;
 
-            // Skip header line
             const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
-            if (!nl) continue;
+            if (!nl) return;
             p = nl + 1;
 
             while (p < end) {
                 nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
                 const char* line_end = nl ? nl : end;
-                const size_t line_len = static_cast<size_t>(line_end - p);
-                std::string_view line(p, line_len);
+                std::string_view line(p, static_cast<size_t>(line_end - p));
                 p = nl ? (nl + 1) : end;
 
                 if (line.empty()) continue;
                 std::string_view c0, c1, c2, c3;
                 if (!parse_strict_4cols(line, c0, c1, c2, c3)) continue;
-
-                // Deduplicate first before validation per pipeline rules
                 if (c0.empty()) continue;
-                uint32_t cid_off = 0, cid_len = 0;
-                if (!seen_click_ids.insert(c0, cid_off, cid_len)) continue;
 
-                if (c1.empty()) continue;
+                ParsedClickRow row{};
+                row.cid_hash = fnv1a_64(c0);
+                row.cid_off = static_cast<uint32_t>(c0.data() - base_ptr);
+                row.cid_len = static_cast<uint32_t>(c0.size());
+                row.valid = 0;
 
-                uint32_t* cit = campaign_to_idx.find(c2);
-                if (!cit || *cit == 0) continue;
-
-                int64_t ts_ms = 0;
-                if (!parse_iso8601_view_to_ms(c3, ts_ms)) continue;
-                if (ts_ms < min_ts || ts_ms >= window_end_ms) continue;
-
-                std::string_view person_sv = c1;
-                if (has_canon) {
-                    user_buf.assign(c1.data(), c1.size());
-                    auto mit = canonical_map.find(user_buf);
-                    if (mit != canonical_map.end()) {
-                        person_sv = mit->second;
+                if (!c1.empty()) {
+                    const uint32_t* cit = campaign_to_idx.find(c2);
+                    if (cit && *cit != 0) {
+                        int64_t ts_ms = 0;
+                        if (parse_iso8601_view_to_ms(c3, ts_ms) && ts_ms >= min_ts && ts_ms < window_end_ms) {
+                            const uint32_t* pit = person_to_idx.find(c1);
+                            if (pit) {
+                                row.person_idx = *pit;
+                                row.campaign_idx = *cit;
+                                row.ts_ms = ts_ms;
+                                row.valid = 1;
+                            }
+                        }
                     }
                 }
-
-                uint32_t* pit = person_to_idx.find(person_sv);
-                if (!pit) continue;
-
-                clicks.push_back(ClickRec{*pit, *cit, ts_ms, cid_off, cid_len});
+                pf.rows.push_back(row);
             }
+        };
+
+        const size_t workers = get_worker_count(num_files);
+        if (workers <= 1) {
+            for (size_t f = 0; f < num_files; ++f) parse_one_file(f);
+        } else {
+            std::atomic<size_t> next_file{0};
+            std::vector<std::thread> threads;
+            threads.reserve(workers);
+            for (size_t t = 0; t < workers; ++t) {
+                threads.emplace_back([&]() {
+                    while (true) {
+                        const size_t f = next_file.fetch_add(1, std::memory_order_relaxed);
+                        if (f >= num_files) break;
+                        parse_one_file(f);
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        }
+
+        const size_t est_clicks = static_cast<size_t>(total_click_bytes / 64) + 64;
+        seen_click_ids.reserve(est_clicks, est_clicks * 16);
+        raw_clicks.reserve(est_clicks / 2 + 64);
+
+        // Sequential first-occurrence deduplication in exact sorted filename order
+        for (size_t f = 0; f < num_files; ++f) {
+            ParsedClickFile& pf = parsed_files[f];
+            const char* base_ptr = pf.file_buf.data();
+            for (const auto& r : pf.rows) {
+                std::string_view cid_sv(base_ptr + r.cid_off, r.cid_len);
+                uint32_t arena_off = 0, arena_len = 0;
+                if (!seen_click_ids.insert_with_hash(cid_sv, r.cid_hash, arena_off, arena_len)) {
+                    continue;
+                }
+                if (r.valid) {
+                    raw_clicks.push_back(ClickRec{r.person_idx, r.campaign_idx, r.ts_ms, arena_off, arena_len});
+                    person_click_counts[r.person_idx] += 1;
+                }
+            }
+            pf.rows.clear();
+            std::vector<ParsedClickRow>().swap(pf.rows);
+            pf.file_buf.clear();
+            std::string().swap(pf.file_buf);
         }
     }
 
-    // Free hash table slots immediately; arena stays alive for click_id tie-breaking during sort
     seen_click_ids.release_table();
     const auto t_clicks = std::chrono::steady_clock::now();
+
+    // O(N) counting sort of clicks by person_idx
+    std::vector<uint32_t> person_click_offsets(num_persons + 1, 0);
+    for (uint32_t p = 0; p < num_persons; ++p) {
+        person_click_offsets[p + 1] = person_click_offsets[p] + person_click_counts[p];
+    }
+
+    std::vector<ClickRec> clicks(raw_clicks.size());
+    std::vector<uint32_t> cwrite = person_click_offsets;
+    for (const auto& c : raw_clicks) {
+        clicks[cwrite[c.person_idx]++] = c;
+    }
+    raw_clicks.clear();
+    std::vector<ClickRec>().swap(raw_clicks);
+
+    const auto t_sort = std::chrono::steady_clock::now();
 
     const size_t num_campaigns = campaign_ids.size();
     const size_t num_days = idx_to_day.size();
@@ -586,105 +713,98 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
     };
 
     const char* arena_base = seen_click_ids.arena_data();
-    std::sort(clicks.begin(), clicks.end(), [arena_base](const ClickRec& a, const ClickRec& b) {
-        if (a.person_idx != b.person_idx) return a.person_idx < b.person_idx;
-        if (a.ts_ms != b.ts_ms) return a.ts_ms < b.ts_ms;
-        const uint32_t min_len = a.click_id_len < b.click_id_len ? a.click_id_len : b.click_id_len;
-        const int cmp = std::memcmp(arena_base + a.click_id_off, arena_base + b.click_id_off, min_len);
-        if (cmp != 0) return cmp < 0;
-        return a.click_id_len < b.click_id_len;
-    });
 
-    // Arena is no longer needed once click_id tie-break order is established
-    seen_click_ids.release_all();
-    const auto t_sort = std::chrono::steady_clock::now();
-
-    // Single pass per person: compute last-click attribution AND interval-merged assists
-    // while srefs[si..s_end) and clicks[c_start..c_end) are hot in L1 cache.
-    size_t si = 0, ci = 0;
-    const size_t sn = srefs.size(), cn = clicks.size();
-
-    while (si < sn) {
-        const uint32_t pidx = srefs[si].person_idx;
-        size_t s_end = si + 1;
-        while (s_end < sn && srefs[s_end].person_idx == pidx) ++s_end;
-
-        while (ci < cn && clicks[ci].person_idx < pidx) ++ci;
-        const size_t c_start = ci;
-        while (ci < cn && clicks[ci].person_idx == pidx) ++ci;
-        const size_t c_end = ci;
+    for (uint32_t p = 0; p < num_persons; ++p) {
+        const size_t si = person_sess_offsets[p];
+        const size_t s_end = person_sess_offsets[p + 1];
+        const size_t c_start = person_click_offsets[p];
+        const size_t c_end = person_click_offsets[p + 1];
 
         if (c_start == c_end) {
             for (size_t i = si; i < s_end; ++i) add_attributed(0, srefs[i]);
-        } else {
-            // 1. Last-click attribution
-            size_t c_ptr = c_start;
-            int64_t best_ts = -1;
-            uint32_t best_camp = 0;
-            bool has_best = false;
+            continue;
+        }
 
-            for (size_t i = si; i < s_end; ++i) {
-                const int64_t s_ts = srefs[i].start_ms;
-                while (c_ptr < c_end && clicks[c_ptr].ts_ms <= s_ts) {
-                    if (!has_best || clicks[c_ptr].ts_ms != best_ts) {
-                        best_ts = clicks[c_ptr].ts_ms;
-                        best_camp = clicks[c_ptr].campaign_idx;
-                        has_best = true;
-                    }
-                    ++c_ptr;
+        // 1. Sort only this person's clicks by (ts_ms, click_id) in L1 cache
+        if (c_end - c_start > 1) {
+            std::sort(clicks.begin() + static_cast<std::ptrdiff_t>(c_start),
+                      clicks.begin() + static_cast<std::ptrdiff_t>(c_end),
+                      [arena_base](const ClickRec& a, const ClickRec& b) {
+                          if (a.ts_ms != b.ts_ms) return a.ts_ms < b.ts_ms;
+                          const uint32_t min_len = a.click_id_len < b.click_id_len ? a.click_id_len : b.click_id_len;
+                          const int cmp = std::memcmp(arena_base + a.click_id_off, arena_base + b.click_id_off, min_len);
+                          if (cmp != 0) return cmp < 0;
+                          return a.click_id_len < b.click_id_len;
+                      });
+        }
+
+        // 2. Last-click attribution
+        size_t c_ptr = c_start;
+        int64_t best_ts = -1;
+        uint32_t best_camp = 0;
+        bool has_best = false;
+
+        for (size_t i = si; i < s_end; ++i) {
+            const int64_t s_ts = srefs[i].start_ms;
+            while (c_ptr < c_end && clicks[c_ptr].ts_ms <= s_ts) {
+                if (!has_best || clicks[c_ptr].ts_ms != best_ts) {
+                    best_ts = clicks[c_ptr].ts_ms;
+                    best_camp = clicks[c_ptr].campaign_idx;
+                    has_best = true;
                 }
-                if (has_best && (s_ts - best_ts) <= SEVEN_DAYS_MS) {
-                    add_attributed(best_camp, srefs[i]);
-                } else {
-                    add_attributed(0, srefs[i]);
-                }
+                ++c_ptr;
             }
-
-            // 2. Assisted sessions: sort only this person's click slice by (campaign_idx, ts_ms)
-            if (c_end - c_start > 1) {
-                std::sort(clicks.begin() + static_cast<std::ptrdiff_t>(c_start),
-                          clicks.begin() + static_cast<std::ptrdiff_t>(c_end),
-                          [](const ClickRec& a, const ClickRec& b) {
-                              if (a.campaign_idx != b.campaign_idx) return a.campaign_idx < b.campaign_idx;
-                              return a.ts_ms < b.ts_ms;
-                          });
-            }
-
-            size_t ac = c_start;
-            while (ac < c_end) {
-                const uint32_t cidx = clicks[ac].campaign_idx;
-                const size_t camp_offset = static_cast<size_t>(cidx) * num_days;
-                size_t s_ptr = si;
-
-                int64_t iv_start = clicks[ac].ts_ms;
-                int64_t iv_end = iv_start + SEVEN_DAYS_MS;
-                ++ac;
-
-                while (ac < c_end && clicks[ac].campaign_idx == cidx) {
-                    const int64_t t = clicks[ac].ts_ms;
-                    if (t <= iv_end) {
-                        iv_end = t + SEVEN_DAYS_MS;
-                    } else {
-                        while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
-                        while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
-                            agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
-                            ++s_ptr;
-                        }
-                        iv_start = t;
-                        iv_end = t + SEVEN_DAYS_MS;
-                    }
-                    ++ac;
-                }
-                while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
-                while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
-                    agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
-                    ++s_ptr;
-                }
+            if (has_best && (s_ts - best_ts) <= SEVEN_DAYS_MS) {
+                add_attributed(best_camp, srefs[i]);
+            } else {
+                add_attributed(0, srefs[i]);
             }
         }
-        si = s_end;
+
+        // 3. Assisted sessions: sort this person's clicks by (campaign_idx, ts_ms) in L1 cache
+        if (c_end - c_start > 1) {
+            std::sort(clicks.begin() + static_cast<std::ptrdiff_t>(c_start),
+                      clicks.begin() + static_cast<std::ptrdiff_t>(c_end),
+                      [](const ClickRec& a, const ClickRec& b) {
+                          if (a.campaign_idx != b.campaign_idx) return a.campaign_idx < b.campaign_idx;
+                          return a.ts_ms < b.ts_ms;
+                      });
+        }
+
+        size_t ac = c_start;
+        while (ac < c_end) {
+            const uint32_t cidx = clicks[ac].campaign_idx;
+            const size_t camp_offset = static_cast<size_t>(cidx) * num_days;
+            size_t s_ptr = si;
+
+            int64_t iv_start = clicks[ac].ts_ms;
+            int64_t iv_end = iv_start + SEVEN_DAYS_MS;
+            ++ac;
+
+            while (ac < c_end && clicks[ac].campaign_idx == cidx) {
+                const int64_t t = clicks[ac].ts_ms;
+                if (t <= iv_end) {
+                    iv_end = t + SEVEN_DAYS_MS;
+                } else {
+                    while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
+                    while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
+                        agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
+                        ++s_ptr;
+                    }
+                    iv_start = t;
+                    iv_end = t + SEVEN_DAYS_MS;
+                }
+                ++ac;
+            }
+            while (s_ptr < s_end && srefs[s_ptr].start_ms < iv_start) ++s_ptr;
+            while (s_ptr < s_end && srefs[s_ptr].start_ms <= iv_end) {
+                agg[camp_offset + srefs[s_ptr].day_idx].assisted_sessions += 1;
+                ++s_ptr;
+            }
+        }
     }
 
+    seen_click_ids.release_all();
     const auto t_attrib = std::chrono::steady_clock::now();
 
     std::vector<CampaignDailyRow> result;
