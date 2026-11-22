@@ -210,6 +210,16 @@ int main(int argc,char**argv){
               !parse_ts(json_property(manifest,"window_end"),hi))throw runtime_error("bad window");
   unordered_map<string,string> categories;
   each_line(data/"products.csv",2,[&](const vector<string>&v){categories.emplace(v[0],v[1]);});
+  // V38: construct read-only string_view lookup indexes once. The owning
+  // std::string maps remain alive through validation, so views are stable.
+  // Avoid temporary std::string allocations on every first-seen raw user
+  // and every first-seen purchase product.
+  unordered_map<string_view,string_view> identity_view;
+  identity_view.reserve(ids.size());
+  for(const auto &kv:ids)identity_view.emplace(string_view(kv.first),string_view(kv.second));
+  unordered_map<string_view,string_view> category_view;
+  category_view.reserve(categories.size());
+  for(const auto &kv:categories)category_view.emplace(string_view(kv.first),string_view(kv.second));
   profile("metadata_and_identity");
   // Store one compact raw line per event_id instead of six separate strings.
   // Dedup still precedes validation (including late/invalid timestamps).
@@ -498,8 +508,8 @@ int main(int argc,char**argv){
   for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
     auto [raw_it,raw_inserted]=raw_user_cache.try_emplace(p.user,0U);
     if(raw_inserted){
-      auto id=ids.find(string(p.user));
-      string person_name=id==ids.end()?string(p.user):id->second;
+      auto id=identity_view.find(p.user);
+      string person_name=id==identity_view.end()?string(p.user):string(id->second);
       auto [person_it,inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
       if(inserted)people.push_back(std::move(person_name));
       *raw_it=person_it->second;
@@ -508,9 +518,9 @@ int main(int argc,char**argv){
     if(p.purchase){
       auto [cat_cached,cat_inserted]=product_category_cache.try_emplace(p.product,0U);
       if(cat_inserted){
-        auto cat_it=categories.find(string(p.product));
+        auto cat_it=category_view.find(p.product);
         static const string unknown="unknown";
-        cat_cached->second=category_number(cat_it==categories.end()?unknown:cat_it->second);
+        cat_cached->second=category_number(cat_it==category_view.end()?unknown:string(cat_it->second));
       }
       cat_id=cat_cached->second;
     }
