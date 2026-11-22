@@ -326,12 +326,20 @@ int main(int argc,char**argv){
   //    open-addressed table (preserving exact smallest lexicographic ingest_ts),
   //    and immediately validates winners into parsed[part].
   constexpr size_t SHARD_COUNT=64;
+  // V60: Single-pass hot-cache parse + dedup record.
+  // Parses ts/ingest/price/type/user/product once in Phase 1 while CSV bytes are
+  // L1-hot, carrying `flags` (bit 0 = valid, bit 1 = purchase) through dedup so
+  // an invalid earlier-ingest duplicate still beats a valid later duplicate.
   struct CompactRow {
     const char *line_ptr;
-    uint32_t line_len;
+    uint64_t hash_code;
+    i64 ts;
+    uint32_t cents;
     uint16_t id_off, id_len;
     uint16_t ing_off, ing_len;
-    uint64_t hash_code;
+    uint16_t user_off, user_len;
+    uint16_t prod_off, prod_len;
+    uint8_t flags; // bit 0: valid, bit 1: purchase
   };
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
   if(const char* cpus=getenv("NCPU")){
@@ -378,13 +386,49 @@ int main(int argc,char**argv){
       const string_view line(base+start,stop-start);
       if(parse_event_views(line,fields)&&!fields[0].empty()){
         const uint64_t h=fast_hash_sv(fields[0]);
-        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-line.data());
+        const char *lp=line.data();
+        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-lp);
         const uint16_t id_len=static_cast<uint16_t>(fields[0].size());
-        const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-line.data());
+        const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-lp);
         const uint16_t ing_len=static_cast<uint16_t>(fields[3].size());
+        const string_view user=fields[1], tsstr=fields[2],
+                          event_type=fields[4], product=fields[5], price=fields[6];
+        uint8_t flags=0;
+        i64 ts=0, ingest=0;
+        uint32_t cents=0;
+        uint16_t user_off=0, user_len=0, prod_off=0, prod_len=0;
+        if(!user.empty()&&!product.empty()&&
+           (event_type=="view"||event_type=="cart"||event_type=="purchase")&&
+           parse_ts(tsstr,ts)&&ts>=lo&&ts<hi&&
+           parse_ts(fields[3],ingest)&&ingest-ts<=DAY_MS){
+          const bool purchase=(event_type=="purchase");
+          bool ok=true;
+          if(purchase){
+            if(price.empty()){ok=false;}
+            else{
+              i64 cval=0;
+              for(char ch:price){
+                const unsigned digit=static_cast<unsigned char>(ch)-'0';
+                if(digit>9 || cval>10000000/10){ok=false;break;}
+                cval=cval*10+digit;
+                if(cval>10000000){ok=false;break;}
+              }
+              if(cval<1)ok=false;
+              else cents=static_cast<uint32_t>(cval);
+            }
+          }
+          if(ok){
+            flags=static_cast<uint8_t>(1U | (purchase?2U:0U));
+            user_off=static_cast<uint16_t>(user.data()-lp);
+            user_len=static_cast<uint16_t>(user.size());
+            prod_off=static_cast<uint16_t>(product.data()-lp);
+            prod_len=static_cast<uint16_t>(product.size());
+          }
+        }
         local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
-            line.data(), static_cast<uint32_t>(line.size()),
-            id_off, id_len, ing_off, ing_len, h});
+            lp, h, ts, cents,
+            id_off, id_len, ing_off, ing_len,
+            user_off, user_len, prod_off, prod_len, flags});
       }
       start=stop+static_cast<size_t>(!!lf);
     }
@@ -558,29 +602,13 @@ int main(int argc,char**argv){
     }
     auto &out=parsed[slot];
     out.reserve(tbl.winners.size());
-    array<string_view,7> columns;
     for(const CompactRow &r:tbl.winners){
-      const string_view line(r.line_ptr,r.line_len);
-      if(!parse_event_views(line,columns))throw runtime_error("internal CSV invariant");
-      const string_view user=columns[1], tsstr=columns[2],
-                        event_type=columns[4], product=columns[5], price=columns[6];
-      if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
-      i64 ts,ingest;
-      if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(columns[3],ingest)||ingest-ts>DAY_MS)continue;
-      i64 cents=0;
-      const bool purchase=event_type=="purchase";
-      if(purchase){
-        if(price.empty())continue;
-        bool valid_price=true;
-        for(char c:price){
-          const unsigned digit=static_cast<unsigned char>(c)-'0';
-          if(digit>9 || cents>10000000/10){valid_price=false;break;}
-          cents=cents*10+digit;
-          if(cents>10000000){valid_price=false;break;}
-        }
-        if(!valid_price||cents<1)continue;
-      }
-      out.push_back(ParsedEvent{ts,cents,user,product,purchase});
+      if(!(r.flags&1U))continue;
+      out.push_back(ParsedEvent{
+          r.ts, static_cast<i64>(r.cents),
+          string_view(r.line_ptr+r.user_off, r.user_len),
+          string_view(r.line_ptr+r.prod_off, r.prod_len),
+          (r.flags&2U)!=0});
     }
   };
   size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
