@@ -171,5 +171,31 @@ class TestNativeCampaign(unittest.TestCase):
             self.assertEqual(out, [("c1", "search", "2026-10-03", 1, 0, 500, 1)])
 
 
+
+    def test_duplicate_click_id_across_files_and_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "clicks").mkdir()
+            write_lf(d / "campaigns.csv", "campaign_id,channel\ncamp1,search\ncamp2,social\n")
+            # part_a.csv is read first by filename even if part_b.csv has an earlier timestamp
+            write_lf(
+                d / "clicks" / "part_a.csv",
+                "click_id,user_id,campaign_id,ts\n"
+                "ck_dup,u1,camp1,2026-01-02T12:00:00Z\n",
+            )
+            write_lf(
+                d / "clicks" / "part_b.csv",
+                "click_id,user_id,campaign_id,ts\n"
+                "ck_dup,u1,camp1,2026-01-02T08:00:00Z\n",
+            )
+            ws = iso_to_ms("2026-01-01T00:00:00Z")
+            we = iso_to_ms("2026-01-10T00:00:00Z")
+            t_sess = iso_to_ms("2026-01-02T13:00:00Z")
+            sessions = [("u1", "2026-01-02", t_sess, 1500, True)]
+            rows = run_native_cli(d, ws, we, {}, sessions)
+            self.assertEqual(rows, [("camp1", "search", "2026-01-02", 1, 1, 1500, 1)])
+
+
 if __name__ == "__main__":
     unittest.main()
+
