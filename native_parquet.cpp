@@ -1,10 +1,11 @@
 ﻿#include "native_parquet.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace native_parquet {
 
@@ -27,7 +28,6 @@ constexpr int32_t ENC_RLE = 3;
 constexpr int32_t CODEC_UNCOMPRESSED = 0;
 constexpr int32_t PAGE_DATA = 0;
 
-// Minimal Thrift Compact Protocol encoder
 class ThriftCompact {
 public:
     std::vector<uint8_t> buf;
@@ -116,27 +116,28 @@ struct RowGroupMeta {
     std::vector<ColChunkMeta> cols;
 };
 
-inline void append_le32(std::vector<uint8_t>& out, uint32_t v) {
-    uint8_t b[4] = {
-        static_cast<uint8_t>(v & 0xFF),
-        static_cast<uint8_t>((v >> 8) & 0xFF),
-        static_cast<uint8_t>((v >> 16) & 0xFF),
-        static_cast<uint8_t>((v >> 24) & 0xFF)
-    };
-    out.insert(out.end(), b, b + 4);
+inline void append_le32_vec(std::vector<uint8_t>& out, uint32_t v) {
+    const size_t old_sz = out.size();
+    out.resize(old_sz + 4);
+    std::memcpy(out.data() + old_sz, &v, 4);
 }
 
-inline void append_le64(std::vector<uint8_t>& out, uint64_t v) {
-    uint8_t b[8];
-    std::memcpy(b, &v, 8);
-    out.insert(out.end(), b, b + 8);
+inline void append_str_bytes(std::vector<uint8_t>& out, std::string_view s) {
+    const uint32_t len = static_cast<uint32_t>(s.size());
+    const size_t old_sz = out.size();
+    out.resize(old_sz + 4 + len);
+    uint8_t* dst = out.data() + old_sz;
+    std::memcpy(dst, &len, 4);
+    if (len > 0) {
+        std::memcpy(dst + 4, s.data(), len);
+    }
 }
 
 // Encode RLE definition levels (bit-width = 1) prefixed with 4-byte LE byte length.
 void encode_rle_def_levels(std::vector<uint8_t>& out, size_t count, const std::vector<uint8_t>* nulls) {
+    out.clear();
     ThriftCompact rle;
     if (!nulls) {
-        // All non-null: single RLE run of 1s
         rle.write_uvarint(static_cast<uint64_t>(count) << 1);
         rle.buf.push_back(1);
     } else {
@@ -150,44 +151,62 @@ void encode_rle_def_levels(std::vector<uint8_t>& out, size_t count, const std::v
             i = j;
         }
     }
-    append_le32(out, static_cast<uint32_t>(rle.buf.size()));
+    append_le32_vec(out, static_cast<uint32_t>(rle.buf.size()));
     out.insert(out.end(), rle.buf.begin(), rle.buf.end());
 }
 
 class ParquetFileCore {
 public:
     ParquetFileCore(const std::string& path, std::vector<ColSpec> schema)
-        : out_(path, std::ios::binary | std::ios::trunc), schema_(std::move(schema)) {
-        if (!out_) throw std::runtime_error("Failed to open Parquet output: " + path);
-        static char io_buf[1 << 20];
-        out_.rdbuf()->pubsetbuf(io_buf, sizeof(io_buf));
+        : io_buf_(1 << 20), schema_(std::move(schema)) {
+        fp_ = std::fopen(path.c_str(), "wb");
+        if (!fp_) throw std::runtime_error("Failed to open Parquet output: " + path);
+        // Thread-safe per-instance 1 MB stdio buffer
+        std::setvbuf(fp_, io_buf_.data(), _IOFBF, io_buf_.size());
         write_bytes("PAR1", 4);
     }
 
-    ColChunkMeta write_data_page(size_t num_values, const std::vector<uint8_t>& page_payload) {
+    ~ParquetFileCore() {
+        if (fp_) {
+            std::fclose(fp_);
+            fp_ = nullptr;
+        }
+    }
+
+    // Zero-copy data page write: emits header + RLE def levels + raw column data directly.
+    ColChunkMeta write_data_page(
+        size_t num_values,
+        const std::vector<uint8_t>& def_levels,
+        const void* values_data,
+        size_t values_bytes
+    ) {
         const int64_t offset = pos_;
-        ThriftCompact hdr;
+        const size_t payload_size = def_levels.size() + values_bytes;
+
+        hdr_.buf.clear();
         int16_t last = 0;
-        hdr.write_i32_field(last, 1, PAGE_DATA);
-        hdr.write_i32_field(last, 2, static_cast<int32_t>(page_payload.size()));
-        hdr.write_i32_field(last, 3, static_cast<int32_t>(page_payload.size()));
-        hdr.write_struct_begin(last, 5);  // DataPageHeader
+        hdr_.write_i32_field(last, 1, PAGE_DATA);
+        hdr_.write_i32_field(last, 2, static_cast<int32_t>(payload_size));
+        hdr_.write_i32_field(last, 3, static_cast<int32_t>(payload_size));
+        hdr_.write_struct_begin(last, 5);  // DataPageHeader
         {
             int16_t dlast = 0;
-            hdr.write_i32_field(dlast, 1, static_cast<int32_t>(num_values));
-            hdr.write_i32_field(dlast, 2, ENC_PLAIN);
-            hdr.write_i32_field(dlast, 3, ENC_RLE);
-            hdr.write_i32_field(dlast, 4, ENC_RLE);
-            hdr.write_stop();
+            hdr_.write_i32_field(dlast, 1, static_cast<int32_t>(num_values));
+            hdr_.write_i32_field(dlast, 2, ENC_PLAIN);
+            hdr_.write_i32_field(dlast, 3, ENC_RLE);
+            hdr_.write_i32_field(dlast, 4, ENC_RLE);
+            hdr_.write_stop();
         }
-        hdr.write_stop();
+        hdr_.write_stop();
 
-        write_bytes(reinterpret_cast<const char*>(hdr.buf.data()), hdr.buf.size());
-        if (!page_payload.empty()) {
-            write_bytes(reinterpret_cast<const char*>(page_payload.data()), page_payload.size());
+        write_bytes(hdr_.buf.data(), hdr_.buf.size());
+        if (!def_levels.empty()) {
+            write_bytes(def_levels.data(), def_levels.size());
         }
-        const int64_t total = pos_ - offset;
-        return ColChunkMeta{offset, total, static_cast<int64_t>(num_values)};
+        if (values_bytes > 0) {
+            write_bytes(values_data, values_bytes);
+        }
+        return ColChunkMeta{offset, pos_ - offset, static_cast<int64_t>(num_values)};
     }
 
     void add_row_group(RowGroupMeta rg) {
@@ -203,10 +222,8 @@ public:
         int16_t last = 0;
         fm.write_i32_field(last, 1, 1);  // version = 1
 
-        // schema (field 2, list<SchemaElement>)
         fm.write_list_header(last, 2, 12, schema_.size() + 1);
         {
-            // Root schema element
             int16_t sl = 0;
             fm.write_string_field(sl, 4, "schema");
             fm.write_i32_field(sl, 5, static_cast<int32_t>(schema_.size()));
@@ -225,7 +242,6 @@ public:
 
         fm.write_i64_field(last, 3, total_rows_);
 
-        // row_groups (field 4, list<RowGroup>)
         fm.write_list_header(last, 4, 12, row_groups_.size());
         for (const auto& rg : row_groups_) {
             int16_t rl = 0;
@@ -260,22 +276,31 @@ public:
         fm.write_string_field(last, 6, "native_parquet_cpp17");
         fm.write_stop();
 
-        write_bytes(reinterpret_cast<const char*>(fm.buf.data()), fm.buf.size());
+        write_bytes(fm.buf.data(), fm.buf.size());
         uint32_t footer_len = static_cast<uint32_t>(fm.buf.size());
-        write_bytes(reinterpret_cast<const char*>(&footer_len), 4);
+        write_bytes(&footer_len, 4);
         write_bytes("PAR1", 4);
-        out_.flush();
+
+        if (fp_) {
+            std::fclose(fp_);
+            fp_ = nullptr;
+        }
     }
 
 private:
-    void write_bytes(const char* data, size_t n) {
-        out_.write(data, static_cast<std::streamsize>(n));
+    void write_bytes(const void* data, size_t n) {
+        if (n == 0) return;
+        if (std::fwrite(data, 1, n, fp_) != n) {
+            throw std::runtime_error("Failed writing Parquet bytes");
+        }
         pos_ += static_cast<int64_t>(n);
     }
 
-    std::ofstream out_;
+    std::vector<char> io_buf_;
+    FILE* fp_ = nullptr;
     std::vector<ColSpec> schema_;
     std::vector<RowGroupMeta> row_groups_;
+    ThriftCompact hdr_;
     int64_t pos_ = 0;
     int64_t total_rows_ = 0;
     bool finished_ = false;
@@ -304,15 +329,20 @@ struct UserDailyParquetWriter::Impl {
     size_t rg_rows = 0;
 
     std::vector<uint8_t> buf_user_id;
-    std::vector<uint8_t> buf_day;
-    std::vector<uint8_t> buf_sessions;
-    std::vector<uint8_t> buf_events;
-    std::vector<uint8_t> buf_rev;
+    std::vector<int32_t> buf_day;
+    std::vector<int64_t> buf_sessions;
+    std::vector<int64_t> buf_events;
+    std::vector<int64_t> buf_rev;
     std::vector<uint8_t> buf_cat;
     std::vector<uint8_t> cat_nulls;
     bool has_any_cat_null = false;
 
-    std::vector<uint8_t> page_tmp;
+    std::vector<uint8_t> def_all_present;
+    std::vector<uint8_t> def_nullable;
+
+    char last_ymd[10] = {};
+    int32_t last_days = 0;
+    bool has_last_ymd = false;
 
     Impl(const std::string& path, size_t limit)
         : core(path, {
@@ -325,12 +355,25 @@ struct UserDailyParquetWriter::Impl {
           }),
           rg_limit(limit) {
         buf_user_id.reserve(limit * 16);
-        buf_day.reserve(limit * 4);
-        buf_sessions.reserve(limit * 8);
-        buf_events.reserve(limit * 8);
-        buf_rev.reserve(limit * 8);
+        buf_day.reserve(limit);
+        buf_sessions.reserve(limit);
+        buf_events.reserve(limit);
+        buf_rev.reserve(limit);
         buf_cat.reserve(limit * 16);
         cat_nulls.reserve(limit);
+    }
+
+    int32_t parse_date_cached(std::string_view ymd) {
+        if (ymd.size() == 10 && has_last_ymd && std::memcmp(last_ymd, ymd.data(), 10) == 0) {
+            return last_days;
+        }
+        int32_t d = parse_date_days(ymd);
+        if (ymd.size() == 10) {
+            std::memcpy(last_ymd, ymd.data(), 10);
+            last_days = d;
+            has_last_ymd = true;
+        }
+        return d;
     }
 
     void flush_rg() {
@@ -340,21 +383,26 @@ struct UserDailyParquetWriter::Impl {
         rg.total_byte_size = 0;
         rg.cols.reserve(6);
 
-        auto emit_col = [&](const std::vector<uint8_t>& values, const std::vector<uint8_t>* nulls) {
-            page_tmp.clear();
-            encode_rle_def_levels(page_tmp, rg_rows, nulls);
-            page_tmp.insert(page_tmp.end(), values.begin(), values.end());
-            ColChunkMeta cm = core.write_data_page(rg_rows, page_tmp);
+        encode_rle_def_levels(def_all_present, rg_rows, nullptr);
+
+        auto emit_raw = [&](const void* ptr, size_t bytes, const std::vector<uint8_t>& def_buf) {
+            ColChunkMeta cm = core.write_data_page(rg_rows, def_buf, ptr, bytes);
             rg.total_byte_size += cm.total_size;
             rg.cols.push_back(cm);
         };
 
-        emit_col(buf_user_id, nullptr);
-        emit_col(buf_day, nullptr);
-        emit_col(buf_sessions, nullptr);
-        emit_col(buf_events, nullptr);
-        emit_col(buf_rev, nullptr);
-        emit_col(buf_cat, has_any_cat_null ? &cat_nulls : nullptr);
+        emit_raw(buf_user_id.data(), buf_user_id.size(), def_all_present);
+        emit_raw(buf_day.data(), buf_day.size() * sizeof(int32_t), def_all_present);
+        emit_raw(buf_sessions.data(), buf_sessions.size() * sizeof(int64_t), def_all_present);
+        emit_raw(buf_events.data(), buf_events.size() * sizeof(int64_t), def_all_present);
+        emit_raw(buf_rev.data(), buf_rev.size() * sizeof(int64_t), def_all_present);
+
+        if (has_any_cat_null) {
+            encode_rle_def_levels(def_nullable, rg_rows, &cat_nulls);
+            emit_raw(buf_cat.data(), buf_cat.size(), def_nullable);
+        } else {
+            emit_raw(buf_cat.data(), buf_cat.size(), def_all_present);
+        }
 
         core.add_row_group(std::move(rg));
 
@@ -390,19 +438,17 @@ void UserDailyParquetWriter::write_row(
     std::string_view top_category,
     bool top_category_is_null
 ) {
-    append_le32(impl_->buf_user_id, static_cast<uint32_t>(user_id.size()));
-    impl_->buf_user_id.insert(impl_->buf_user_id.end(), user_id.begin(), user_id.end());
-    append_le32(impl_->buf_day, static_cast<uint32_t>(day_days));
-    append_le64(impl_->buf_sessions, static_cast<uint64_t>(sessions));
-    append_le64(impl_->buf_events, static_cast<uint64_t>(events));
-    append_le64(impl_->buf_rev, static_cast<uint64_t>(revenue_cents));
+    append_str_bytes(impl_->buf_user_id, user_id);
+    impl_->buf_day.push_back(day_days);
+    impl_->buf_sessions.push_back(sessions);
+    impl_->buf_events.push_back(events);
+    impl_->buf_rev.push_back(revenue_cents);
 
     impl_->cat_nulls.push_back(top_category_is_null ? 1 : 0);
     if (top_category_is_null) {
         impl_->has_any_cat_null = true;
     } else {
-        append_le32(impl_->buf_cat, static_cast<uint32_t>(top_category.size()));
-        impl_->buf_cat.insert(impl_->buf_cat.end(), top_category.begin(), top_category.end());
+        append_str_bytes(impl_->buf_cat, top_category);
     }
 
     if (++impl_->rg_rows >= impl_->rg_limit) {
@@ -411,7 +457,7 @@ void UserDailyParquetWriter::write_row(
 }
 
 void UserDailyParquetWriter::write_row(const UserDailyRow& r) {
-    write_row(r.user_id, parse_date_days(r.day), r.sessions, r.events,
+    write_row(r.user_id, impl_->parse_date_cached(r.day), r.sessions, r.events,
               r.revenue_cents, r.top_category, r.top_category_is_null);
 }
 
@@ -429,12 +475,16 @@ struct CampaignDailyParquetWriter::Impl {
 
     std::vector<uint8_t> buf_cid;
     std::vector<uint8_t> buf_channel;
-    std::vector<uint8_t> buf_day;
-    std::vector<uint8_t> buf_sessions;
-    std::vector<uint8_t> buf_purch;
-    std::vector<uint8_t> buf_rev;
-    std::vector<uint8_t> buf_assisted;
-    std::vector<uint8_t> page_tmp;
+    std::vector<int32_t> buf_day;
+    std::vector<int64_t> buf_sessions;
+    std::vector<int64_t> buf_purch;
+    std::vector<int64_t> buf_rev;
+    std::vector<int64_t> buf_assisted;
+    std::vector<uint8_t> def_all_present;
+
+    char last_ymd[10] = {};
+    int32_t last_days = 0;
+    bool has_last_ymd = false;
 
     Impl(const std::string& path, size_t limit)
         : core(path, {
@@ -448,6 +498,19 @@ struct CampaignDailyParquetWriter::Impl {
           }),
           rg_limit(limit) {}
 
+    int32_t parse_date_cached(std::string_view ymd) {
+        if (ymd.size() == 10 && has_last_ymd && std::memcmp(last_ymd, ymd.data(), 10) == 0) {
+            return last_days;
+        }
+        int32_t d = parse_date_days(ymd);
+        if (ymd.size() == 10) {
+            std::memcpy(last_ymd, ymd.data(), 10);
+            last_days = d;
+            has_last_ymd = true;
+        }
+        return d;
+    }
+
     void flush_rg() {
         if (rg_rows == 0) return;
         RowGroupMeta rg;
@@ -455,22 +518,21 @@ struct CampaignDailyParquetWriter::Impl {
         rg.total_byte_size = 0;
         rg.cols.reserve(7);
 
-        auto emit_col = [&](const std::vector<uint8_t>& values) {
-            page_tmp.clear();
-            encode_rle_def_levels(page_tmp, rg_rows, nullptr);
-            page_tmp.insert(page_tmp.end(), values.begin(), values.end());
-            ColChunkMeta cm = core.write_data_page(rg_rows, page_tmp);
+        encode_rle_def_levels(def_all_present, rg_rows, nullptr);
+
+        auto emit_raw = [&](const void* ptr, size_t bytes) {
+            ColChunkMeta cm = core.write_data_page(rg_rows, def_all_present, ptr, bytes);
             rg.total_byte_size += cm.total_size;
             rg.cols.push_back(cm);
         };
 
-        emit_col(buf_cid);
-        emit_col(buf_channel);
-        emit_col(buf_day);
-        emit_col(buf_sessions);
-        emit_col(buf_purch);
-        emit_col(buf_rev);
-        emit_col(buf_assisted);
+        emit_raw(buf_cid.data(), buf_cid.size());
+        emit_raw(buf_channel.data(), buf_channel.size());
+        emit_raw(buf_day.data(), buf_day.size() * sizeof(int32_t));
+        emit_raw(buf_sessions.data(), buf_sessions.size() * sizeof(int64_t));
+        emit_raw(buf_purch.data(), buf_purch.size() * sizeof(int64_t));
+        emit_raw(buf_rev.data(), buf_rev.size() * sizeof(int64_t));
+        emit_raw(buf_assisted.data(), buf_assisted.size() * sizeof(int64_t));
 
         core.add_row_group(std::move(rg));
 
@@ -505,15 +567,13 @@ void CampaignDailyParquetWriter::write_row(
     int64_t revenue_cents,
     int64_t assisted_sessions
 ) {
-    append_le32(impl_->buf_cid, static_cast<uint32_t>(campaign_id.size()));
-    impl_->buf_cid.insert(impl_->buf_cid.end(), campaign_id.begin(), campaign_id.end());
-    append_le32(impl_->buf_channel, static_cast<uint32_t>(channel.size()));
-    impl_->buf_channel.insert(impl_->buf_channel.end(), channel.begin(), channel.end());
-    append_le32(impl_->buf_day, static_cast<uint32_t>(day_days));
-    append_le64(impl_->buf_sessions, static_cast<uint64_t>(sessions));
-    append_le64(impl_->buf_purch, static_cast<uint64_t>(purchasing_sessions));
-    append_le64(impl_->buf_rev, static_cast<uint64_t>(revenue_cents));
-    append_le64(impl_->buf_assisted, static_cast<uint64_t>(assisted_sessions));
+    append_str_bytes(impl_->buf_cid, campaign_id);
+    append_str_bytes(impl_->buf_channel, channel);
+    impl_->buf_day.push_back(day_days);
+    impl_->buf_sessions.push_back(sessions);
+    impl_->buf_purch.push_back(purchasing_sessions);
+    impl_->buf_rev.push_back(revenue_cents);
+    impl_->buf_assisted.push_back(assisted_sessions);
 
     if (++impl_->rg_rows >= impl_->rg_limit) {
         impl_->flush_rg();
@@ -521,7 +581,7 @@ void CampaignDailyParquetWriter::write_row(
 }
 
 void CampaignDailyParquetWriter::write_row(const CampaignDailyRow& r) {
-    write_row(r.campaign_id, r.channel, parse_date_days(r.day), r.sessions,
+    write_row(r.campaign_id, r.channel, impl_->parse_date_cached(r.day), r.sessions,
               r.purchasing_sessions, r.revenue_cents, r.assisted_sessions);
 }
 
@@ -547,52 +607,83 @@ void write_campaign_daily_parquet(const std::string& parquet_path, const std::ve
 #ifdef NATIVE_PARQUET_CLI
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: native_parquet_cli bench <out_path> <num_rows>\n"
+        std::cerr << "usage: native_parquet_cli bench <out_path> <num_rows> [threads=1] [rg_size=262144]\n"
                   << "       native_parquet_cli test_samples <dir>\n";
         return 2;
     }
     std::string mode = argv[1];
-    if (mode == "bench" && argc == 4) {
+    if (mode == "bench" && argc >= 4) {
         const std::string out_path = argv[2];
         const size_t n = std::stoull(argv[3]);
+        const size_t threads = (argc >= 5) ? std::stoull(argv[4]) : 1;
+        const size_t rg_size = (argc >= 6) ? std::stoull(argv[5]) : 262144;
+
+        // Pre-build a small pool of realistic strings to isolate pure writer time from snprintf
+        std::vector<std::string> uids(65536);
+        for (size_t i = 0; i < uids.size(); ++i) uids[i] = "user_" + std::to_string(1000000 + i);
+        std::vector<std::string> cats(16);
+        for (size_t i = 0; i < cats.size(); ++i) cats[i] = "category_" + std::to_string(i);
+        const int32_t base_day = native_parquet::parse_date_days("2026-10-01");
+
         auto t0 = std::chrono::steady_clock::now();
-        native_parquet::UserDailyParquetWriter w(out_path, 262144);
-        int32_t base_day = native_parquet::parse_date_days("2026-10-01");
-        char uid_buf[32];
-        char cat_buf[32];
-        for (size_t i = 0; i < n; ++i) {
-            int ulen = std::snprintf(uid_buf, sizeof(uid_buf), "u_%zu", i);
-            int clen = std::snprintf(cat_buf, sizeof(cat_buf), "cat_%zu", i % 15);
-            w.write_row(
-                std::string_view(uid_buf, ulen),
-                base_day + static_cast<int32_t>(i % 28),
-                static_cast<int64_t>((i % 5) + 1),
-                static_cast<int64_t>((i % 20) + 1),
-                static_cast<int64_t>((i % 100) * 100),
-                std::string_view(cat_buf, clen),
-                false
-            );
+        if (threads <= 1) {
+            native_parquet::UserDailyParquetWriter w(out_path, rg_size);
+            for (size_t i = 0; i < n; ++i) {
+                w.write_row(
+                    uids[i & 65535],
+                    base_day + static_cast<int32_t>(i % 28),
+                    static_cast<int64_t>((i % 5) + 1),
+                    static_cast<int64_t>((i % 20) + 1),
+                    static_cast<int64_t>((i % 100) * 100),
+                    cats[i & 15],
+                    false
+                );
+            }
+            w.finish();
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(threads);
+            const size_t chunk = (n + threads - 1) / threads;
+            for (size_t t = 0; t < threads; ++t) {
+                const size_t begin = t * chunk;
+                const size_t end = std::min(n, begin + chunk);
+                if (begin >= end) break;
+                const std::string shard = out_path + "." + std::to_string(t) + ".parquet";
+                pool.emplace_back([&, begin, end, shard]() {
+                    native_parquet::UserDailyParquetWriter w(shard, rg_size);
+                    for (size_t i = begin; i < end; ++i) {
+                        w.write_row(
+                            uids[i & 65535],
+                            base_day + static_cast<int32_t>(i % 28),
+                            static_cast<int64_t>((i % 5) + 1),
+                            static_cast<int64_t>((i % 20) + 1),
+                            static_cast<int64_t>((i % 100) * 100),
+                            cats[i & 15],
+                            false
+                        );
+                    }
+                    w.finish();
+                });
+            }
+            for (auto& th : pool) th.join();
         }
-        w.finish();
         auto t1 = std::chrono::steady_clock::now();
         double sec = std::chrono::duration<double>(t1 - t0).count();
-        std::cout << "CPP_DIRECT_PARQUET_SECONDS=" << sec << "\n";
+        std::cout << "CPP_DIRECT_PARQUET_SECONDS=" << sec
+                  << " rows=" << n << " threads=" << threads << " rg=" << rg_size << "\n";
         return 0;
     }
     if (mode == "test_samples") {
         const std::string dir = argv[2];
-        // 1. Empty user_daily & campaign_daily
         native_parquet::write_user_daily_parquet(dir + "/empty_user.parquet", {});
         native_parquet::write_campaign_daily_parquet(dir + "/empty_campaign.parquet", {});
 
-        // 2. Populated user_daily with nulls, empty strings, UTF-8, quotes
         native_parquet::write_user_daily_parquet(dir + "/sample_user.parquet", {
             {"u_1", "2026-10-01", 2, 10, 5000, "electronics", false},
             {"u_2", "2026-10-02", 1, 3, 0, "", true},
             {"u_\"3\"", "2026-10-03", 4, 12, 9999, "caf\xC3\xA9,books", false},
         });
 
-        // 3. Populated campaign_daily
         native_parquet::write_campaign_daily_parquet(dir + "/sample_campaign.parquet", {
             {"camp_1", "search", "2026-10-01", 10, 4, 25000, 12},
             {"organic", "organic", "2026-10-02", 5, 1, 1500, 0},
