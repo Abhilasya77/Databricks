@@ -317,112 +317,21 @@ int main(int argc,char**argv){
     }
     mappings.push_back(move(f));
   }
-  constexpr size_t SHARD_COUNT=128;
-  struct FlatRows {
-    struct Entry { string_view first; Raw second; size_t hash_code; };
-    vector<Entry> entries;
-    vector<uint32_t> slots;
-    size_t size() const { return entries.size(); }
-    void rehash_to(size_t capacity){
-      vector<uint32_t> next(capacity,0);
-      for(size_t i=0;i<entries.size();++i){
-        size_t pos=(entries[i].hash_code>>7)&(capacity-1);
-        while(next[pos])pos=(pos+1)&(capacity-1);
-        next[pos]=static_cast<uint32_t>(i+1);
-      }
-      slots.swap(next);
-    }
-    void reserve(size_t n){
-      entries.reserve(n);
-      size_t capacity=16;
-      while(capacity<n*2)capacity*=2;
-      rehash_to(capacity);
-    }
-    pair<Entry*,bool> try_emplace(string_view key,size_t hash_code){
-      if(slots.empty())rehash_to(16);
-      if((entries.size()+1)*10>=slots.size()*7)rehash_to(slots.size()*2);
-      size_t pos=(hash_code>>7)&(slots.size()-1);
-      while(slots[pos]){
-        Entry &e=entries[slots[pos]-1];
-        if(e.hash_code==hash_code && e.first==key)return {&e,false};
-        pos=(pos+1)&(slots.size()-1);
-      }
-      if(entries.size()==UINT32_MAX)throw runtime_error("too many event IDs per shard");
-      entries.push_back(Entry{key,Raw{},hash_code});
-      slots[pos]=static_cast<uint32_t>(entries.size());
-      return {&entries.back(),true};
-    }
-    auto begin() const{return entries.begin();}
-    auto end() const{return entries.end();}
-    void clear(){entries.clear();slots.clear();}
-  };
-  struct Shard { mutex lock; FlatRows rows; };
-  array<Shard,SHARD_COUNT> shards;
-  const size_t hint_per_shard=min<size_t>(250000,static_cast<size_t>(estimated_bytes/150/SHARD_COUNT));
-  for(auto &shard:shards)shard.rows.reserve(hint_per_shard);
-
-  // V40: buffer candidate rows by their destination shard. A worker obtains
-  // one lock per populated shard per task instead of one lock per event.
-  // Winner selection is order-independent: minimum lexicographic ingest value.
-  struct Candidate {
-    string_view id;
-    Raw raw;
-    size_t hash_code;
-  };
-  // V47: reuse per-worker shard staging buffers across 8 MiB tasks.
-  // Previously each task allocated and freed up to 128 vectors, even when
-  // the same worker immediately processed another chunk. All staged views
-  // point into read-only mmaps, and are cleared after each shard merge.
-  using StagedBatches = array<vector<Candidate>,SHARD_COUNT>;
-  auto read_task=[&](const Task &task, StagedBatches &staged){
-    const MappedFile &f=*task.file;
-    const char *const base=f.data;
-    const size_t file_end=f.size;
-    size_t start=static_cast<size_t>(task.begin);
-    if(start==0){
-      // Skip the CSV header, even if the header occupies the whole file.
-      const void *lf=memchr(base,'\n',file_end);
-      if(!lf)return;
-      start=static_cast<const char*>(lf)-base+1;
-    }else{
-      // Exactly-on-boundary lines belong to this chunk. Otherwise skip the
-      // fragment that belongs to the preceding chunk.
-      if(base[start-1]!='\n'){
-        const void *lf=memchr(base+start,'\n',file_end-start);
-        if(!lf)return;
-        start=static_cast<const char*>(lf)-base+1;
-      }
-    }
-    while(start<task.end && start<file_end){
-      const void *lf=memchr(base+start,'\n',file_end-start);
-      const size_t stop=lf?static_cast<const char*>(lf)-base:file_end;
-      const string_view line(base+start,stop-start);
-      array<string_view,7> fields;
-      if(parse_event_views(line,fields)&&!fields[0].empty()){
-        const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
-        const uint32_t il=static_cast<uint32_t>(fields[3].size());
-        const size_t idhash=static_cast<size_t>(fast_hash_sv(fields[0]));
-        staged[idhash&(SHARD_COUNT-1)].push_back(Candidate{fields[0],Raw{line,ip,il},idhash});
-      }
-      start=stop+static_cast<size_t>(!!lf);
-    }
-    for(size_t shard_id=0;shard_id<SHARD_COUNT;++shard_id){
-      auto &batch=staged[shard_id];
-      if(batch.empty())continue;
-      Shard &shard=shards[shard_id];
-      lock_guard<mutex> guard(shard.lock);
-      for(const Candidate &c:batch){
-        auto [it,inserted]=shard.rows.try_emplace(c.id,c.hash_code);
-        if(inserted)it->second=c.raw;
-        else {
-          Raw &prev=it->second;
-          const string_view prev_ingest(prev.line.data()+prev.ingest_pos,prev.ingest_len);
-          const string_view candidate_ingest(c.raw.line.data()+c.raw.ingest_pos,c.raw.ingest_len);
-          if(candidate_ingest<prev_ingest)prev=c.raw;
-        }
-      }
-      batch.clear(); // retain capacity for this worker's next task
-    }
+  // V58 architectural redesign:
+  // 1) Zero-lock parallel CSV scan: each worker extracts compact mmap-backed
+  //    winner references (line ptr/len, event_id & ingest_ts offsets, 64-bit hash)
+  //    into thread-local partition buckets (64 partitions). Zero mutex contention.
+  // 2) Zero-lock parallel partition dedup + validation: each worker owns one
+  //    disjoint partition at a time, deduplicates in a single reusable L2/L3-friendly
+  //    open-addressed table (preserving exact smallest lexicographic ingest_ts),
+  //    and immediately validates winners into parsed[part].
+  constexpr size_t SHARD_COUNT=64;
+  struct CompactRow {
+    const char *line_ptr;
+    uint32_t line_len;
+    uint16_t id_off, id_len;
+    uint16_t ing_off, ing_len;
+    uint64_t hash_code;
   };
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
   if(const char* cpus=getenv("NCPU")){
@@ -437,21 +346,63 @@ int main(int argc,char**argv){
     if(stop!=cpus&&*stop=='\0'&&requested>0)
       thread_count=min<size_t>(16,static_cast<size_t>(requested));
   }
-  thread_count=min(thread_count,tasks.size());
+  thread_count=max<size_t>(1,min(thread_count,tasks.size()?tasks.size():size_t(1)));
+
+  // Per-worker partitioned compact row buffers: worker_buckets[tid][part]
+  vector<array<vector<CompactRow>,SHARD_COUNT>> worker_buckets(thread_count);
+  const size_t per_worker_part_hint=min<size_t>(
+      65536, static_cast<size_t>(estimated_bytes/140/(thread_count*SHARD_COUNT)+64));
+  for(auto &wb:worker_buckets)
+    for(auto &b:wb)b.reserve(per_worker_part_hint);
+
+  auto scan_task=[&](const Task &task, array<vector<CompactRow>,SHARD_COUNT> &local_parts){
+    const MappedFile &f=*task.file;
+    const char *const base=f.data;
+    const size_t file_end=f.size;
+    size_t start=static_cast<size_t>(task.begin);
+    if(start==0){
+      const void *lf=memchr(base,'\n',file_end);
+      if(!lf)return;
+      start=static_cast<const char*>(lf)-base+1;
+    }else{
+      if(base[start-1]!='\n'){
+        const void *lf=memchr(base+start,'\n',file_end-start);
+        if(!lf)return;
+        start=static_cast<const char*>(lf)-base+1;
+      }
+    }
+    array<string_view,7> fields;
+    while(start<task.end && start<file_end){
+      const void *lf=memchr(base+start,'\n',file_end-start);
+      const size_t stop=lf?static_cast<const char*>(lf)-base:file_end;
+      const string_view line(base+start,stop-start);
+      if(parse_event_views(line,fields)&&!fields[0].empty()){
+        const uint64_t h=fast_hash_sv(fields[0]);
+        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-line.data());
+        const uint16_t id_len=static_cast<uint16_t>(fields[0].size());
+        const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-line.data());
+        const uint16_t ing_len=static_cast<uint16_t>(fields[3].size());
+        local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+            line.data(), static_cast<uint32_t>(line.size()),
+            id_off, id_len, ing_off, ing_len, h});
+      }
+      start=stop+static_cast<size_t>(!!lf);
+    }
+  };
+
   if(thread_count==1){
-    StagedBatches staged;
-    for(const auto &task:tasks)read_task(task,staged);
-  }else if(thread_count>1){
+    for(const auto &task:tasks)scan_task(task,worker_buckets[0]);
+  }else{
     atomic<size_t> next{0};
     exception_ptr failure;
     mutex failure_lock;
-    auto worker=[&](){
+    auto worker=[&](size_t tid){
       try{
-        StagedBatches staged; // private to worker; no synchronization needed
+        auto &local_parts=worker_buckets[tid];
         for(;;){
           size_t idx=next.fetch_add(1,memory_order_relaxed);
           if(idx>=tasks.size())break;
-          read_task(tasks[idx],staged);
+          scan_task(tasks[idx],local_parts);
         }
       }catch(...){
         lock_guard<mutex> guard(failure_lock);
@@ -460,13 +411,13 @@ int main(int argc,char**argv){
     };
     vector<thread> workers;
     workers.reserve(thread_count);
-    for(size_t i=0;i<thread_count;++i)workers.emplace_back(worker);
+    for(size_t i=0;i<thread_count;++i)workers.emplace_back(worker,i);
     for(auto &worker_thread:workers)worker_thread.join();
     if(failure)rethrow_exception(failure);
   }
   profile("event_dedup");
   size_t n_raw=0;
-  for(const auto &shard:shards)n_raw+=shard.rows.size();
+  for(const auto &wb:worker_buckets)for(const auto &b:wb)n_raw+=b.size();
   vector<Event> events;events.reserve(n_raw);
   // Intern the canonical person and purchase category once. Events now store
   // 32-byte POD records instead of two separately allocated strings.
@@ -552,13 +503,65 @@ int main(int argc,char**argv){
     bool purchase;
   };
   vector<vector<ParsedEvent>> parsed(SHARD_COUNT);
-  auto validate_shard=[&](size_t slot){
+  // Fused lock-free per-partition dedup + validation using a reusable thread-local table.
+  struct LocalDedupTable {
+    vector<CompactRow> winners;
+    vector<uint32_t> slots;
+    void reset(size_t expected){
+      winners.clear();
+      winners.reserve(expected);
+      size_t cap=16;
+      while(cap<expected*2)cap*=2;
+      slots.assign(cap,0);
+    }
+    void rehash(size_t cap){
+      vector<uint32_t> next(cap,0);
+      const size_t mask=cap-1;
+      for(size_t i=0;i<winners.size();++i){
+        size_t pos=(winners[i].hash_code>>6)&mask;
+        while(next[pos])pos=(pos+1)&mask;
+        next[pos]=static_cast<uint32_t>(i+1);
+      }
+      slots.swap(next);
+    }
+    void upsert(const CompactRow &c){
+      if((winners.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
+      const size_t mask=slots.size()-1;
+      size_t pos=(c.hash_code>>6)&mask;
+      const string_view cid(c.line_ptr+c.id_off,c.id_len);
+      while(uint32_t s=slots[pos]){
+        CompactRow &w=winners[s-1];
+        if(w.hash_code==c.hash_code &&
+           w.id_len==c.id_len &&
+           memcmp(w.line_ptr+w.id_off,cid.data(),c.id_len)==0){
+          const string_view prev_ing(w.line_ptr+w.ing_off,w.ing_len);
+          const string_view cand_ing(c.line_ptr+c.ing_off,c.ing_len);
+          if(cand_ing<prev_ing)w=c;
+          return;
+        }
+        pos=(pos+1)&mask;
+      }
+      winners.push_back(c);
+      slots[pos]=static_cast<uint32_t>(winners.size());
+    }
+  };
+
+  auto validate_shard=[&](size_t slot, LocalDedupTable &tbl){
+    size_t total_in=0;
+    for(size_t tid=0;tid<thread_count;++tid)total_in+=worker_buckets[tid][slot].size();
+    if(total_in==0)return;
+    tbl.reset(total_in);
+    for(size_t tid=0;tid<thread_count;++tid){
+      auto &b=worker_buckets[tid][slot];
+      for(const CompactRow &c:b)tbl.upsert(c);
+      vector<CompactRow>().swap(b); // free partition input immediately
+    }
     auto &out=parsed[slot];
-    out.reserve(shards[slot].rows.size());
+    out.reserve(tbl.winners.size());
     array<string_view,7> columns;
-    for(const auto &entry:shards[slot].rows){
-      const Raw &r=entry.second;
-      if(!parse_event_views(r.line,columns))throw runtime_error("internal CSV invariant");
+    for(const CompactRow &r:tbl.winners){
+      const string_view line(r.line_ptr,r.line_len);
+      if(!parse_event_views(line,columns))throw runtime_error("internal CSV invariant");
       const string_view user=columns[1], tsstr=columns[2],
                         event_type=columns[4], product=columns[5], price=columns[6];
       if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
@@ -567,8 +570,6 @@ int main(int argc,char**argv){
       i64 cents=0;
       const bool purchase=event_type=="purchase";
       if(purchase){
-        // V53: validate and accumulate price in one pass, with an early
-        // range cutoff. Invalid or out-of-range prices are discarded alike.
         if(price.empty())continue;
         bool valid_price=true;
         for(char c:price){
@@ -584,17 +585,19 @@ int main(int argc,char**argv){
   };
   size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
   if(validation_threads<=1){
-    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s);
+    LocalDedupTable tbl;
+    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s,tbl);
   }else{
     atomic<size_t> next_shard{0};
     exception_ptr failure;
     mutex failure_lock;
     auto worker=[&](){
       try{
+        LocalDedupTable tbl;
         for(;;){
           auto slot=next_shard.fetch_add(1,memory_order_relaxed);
           if(slot>=SHARD_COUNT)break;
-          validate_shard(slot);
+          validate_shard(slot,tbl);
         }
       }catch(...){
         lock_guard<mutex> g(failure_lock);
@@ -648,7 +651,7 @@ int main(int argc,char**argv){
   }
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
-  for(auto &shard:shards){shard.rows.clear();}
+  worker_buckets.clear();
   // Assign each person a lexicographic rank so the global sort compares
   // integers, not UTF-8 strings, for every event comparison.
   vector<uint32_t> order(people.size());
