@@ -216,6 +216,15 @@ int main(int argc,char**argv){
               !parse_ts(json_property(manifest,"window_end"),hi))throw runtime_error("bad window");
   unordered_map<string,string> categories;
   each_line(data/"products.csv",2,[&](const vector<string>&v){categories.emplace(v[0],v[1]);});
+  // V43: stable borrowed-key indexes eliminate temporary std::string
+  // construction for each unique raw user and purchased product lookup.
+  // Keep owning maps unmodified for the lifetime of these string_views.
+  unordered_map<string_view,string_view> identity_lookup;
+  identity_lookup.reserve(ids.size());
+  for(const auto &kv:ids)identity_lookup.emplace(string_view(kv.first),string_view(kv.second));
+  unordered_map<string_view,string_view> product_lookup;
+  product_lookup.reserve(categories.size());
+  for(const auto &kv:categories)product_lookup.emplace(string_view(kv.first),string_view(kv.second));
   profile("metadata_and_identity");
   // Store one compact raw line per event_id instead of six separate strings.
   // Dedup still precedes validation (including late/invalid timestamps).
@@ -521,8 +530,8 @@ int main(int argc,char**argv){
   for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
     auto [raw_it,raw_inserted]=raw_user_cache.try_emplace(p.user,0U);
     if(raw_inserted){
-      auto id=ids.find(string(p.user));
-      string person_name=id==ids.end()?string(p.user):id->second;
+      auto id=identity_lookup.find(p.user);
+      string person_name=id==identity_lookup.end()?string(p.user):string(id->second);
       auto [person_it,inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
       if(inserted)people.push_back(std::move(person_name));
       *raw_it=person_it->second;
@@ -531,9 +540,10 @@ int main(int argc,char**argv){
     if(p.purchase){
       auto [cat_cached,cat_inserted]=product_category_cache.try_emplace(p.product,0U);
       if(cat_inserted){
-        auto cat_it=categories.find(string(p.product));
+        auto cat_it=product_lookup.find(p.product);
         static const string unknown="unknown";
-        cat_cached->second=category_number(cat_it==categories.end()?unknown:cat_it->second);
+        // Convert only a found category name when interning its numeric ID.
+        cat_cached->second=category_number(cat_it==product_lookup.end()?unknown:string(cat_it->second));
       }
       cat_id=cat_cached->second;
     }
