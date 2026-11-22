@@ -514,8 +514,10 @@ int main(int argc,char**argv){
     void reset(size_t expected){
       winners.clear();
       winners.reserve(expected);
+      // V67: size to smallest power-of-2 staying under 70% load (no rehash, tighter L2/L3 footprint).
+      const size_t min_cap=(expected*10)/7+2;
       size_t cap=16;
-      while(cap<expected*2)cap*=2;
+      while(cap<min_cap)cap*=2;
       slots.assign(cap,0);
     }
     void rehash(size_t cap){
@@ -563,9 +565,33 @@ int main(int argc,char**argv){
   vector<vector<vector<PersonEvent>>> person_buckets;
   if(direct_parquet){
     person_buckets.resize(validation_threads);
-    for(auto &vb:person_buckets)vb.resize(PERSON_PARTS);
+    // V67: reserve realistic per-partition estimate once per worker bucket.
+    const size_t est_bucket=min<size_t>(
+        262144, (n_raw/max<size_t>(1, validation_threads*PERSON_PARTS))+64);
+    for(auto &vb:person_buckets){
+      vb.resize(PERSON_PARTS);
+      for(auto &b:vb)b.reserve(est_bucket);
+    }
   }
-  auto validate_shard=[&](size_t slot, LocalDedupTable &tbl, size_t worker_tid){
+  // V67: bounded direct-mapped per-worker cache for raw_user -> (canonical_person, ppart).
+  struct CanonicalUserCache {
+    static constexpr size_t SIZE=4096;
+    static constexpr size_t MASK=SIZE-1;
+    struct Slot {
+      uint64_t raw_hash=0;
+      string_view raw_user;
+      string_view canonical_person;
+      uint8_t ppart=0;
+      bool occupied=false;
+    };
+    vector<Slot> table;
+    uint64_t lookups=0;
+    uint64_t hits=0;
+    CanonicalUserCache():table(SIZE){}
+  };
+  atomic<uint64_t> total_ucache_lookups{0};
+  atomic<uint64_t> total_ucache_hits{0};
+  auto validate_shard=[&](size_t slot, LocalDedupTable &tbl, CanonicalUserCache &ucache, size_t worker_tid){
     size_t total_in=0;
     for(size_t tid=0;tid<thread_count;++tid)total_in+=worker_buckets[tid][slot].size();
     if(total_in==0)return;
@@ -600,14 +626,30 @@ int main(int argc,char**argv){
         if(!valid_price||cents<1)continue;
       }
       if(direct_parquet){
-        auto id=identity_lookup.find(user);
-        const string_view person=(id==identity_lookup.end())?user:id->second;
+        const uint64_t uh=fast_hash_sv(user);
+        auto &cslot=ucache.table[static_cast<size_t>(uh)&CanonicalUserCache::MASK];
+        ++ucache.lookups;
+        string_view person;
+        size_t ppart=0;
+        if(cslot.occupied && cslot.raw_hash==uh && cslot.raw_user==user){
+          ++ucache.hits;
+          person=cslot.canonical_person;
+          ppart=cslot.ppart;
+        }else{
+          auto id=identity_lookup.find(user);
+          person=(id==identity_lookup.end())?user:id->second;
+          ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
+          cslot.raw_hash=uh;
+          cslot.raw_user=user;
+          cslot.canonical_person=person;
+          cslot.ppart=static_cast<uint8_t>(ppart);
+          cslot.occupied=true;
+        }
         uint32_t cat_id=0;
         if(purchase){
           auto cit=product_cat_id.find(product);
           cat_id=(cit==product_cat_id.end())?unknown_cat_id:cit->second;
         }
-        const size_t ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
         person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,cents,person,cat_id,purchase});
       }else{
         out_parsed->push_back(ParsedEvent{ts,cents,user,product,purchase});
@@ -616,7 +658,10 @@ int main(int argc,char**argv){
   };
   if(validation_threads<=1){
     LocalDedupTable tbl;
-    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s,tbl,0);
+    CanonicalUserCache ucache;
+    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s,tbl,ucache,0);
+    total_ucache_lookups.fetch_add(ucache.lookups,memory_order_relaxed);
+    total_ucache_hits.fetch_add(ucache.hits,memory_order_relaxed);
   }else{
     atomic<size_t> next_shard{0};
     exception_ptr failure;
@@ -624,11 +669,14 @@ int main(int argc,char**argv){
     auto worker=[&](size_t tid){
       try{
         LocalDedupTable tbl;
+        CanonicalUserCache ucache;
         for(;;){
           auto slot=next_shard.fetch_add(1,memory_order_relaxed);
           if(slot>=SHARD_COUNT)break;
-          validate_shard(slot,tbl,tid);
+          validate_shard(slot,tbl,ucache,tid);
         }
+        total_ucache_lookups.fetch_add(ucache.lookups,memory_order_relaxed);
+        total_ucache_hits.fetch_add(ucache.hits,memory_order_relaxed);
       }catch(...){
         lock_guard<mutex> g(failure_lock);
         if(!failure)failure=current_exception();
@@ -639,6 +687,12 @@ int main(int argc,char**argv){
     for(size_t i=0;i<validation_threads;++i)workers.emplace_back(worker,i);
     for(auto &t:workers)t.join();
     if(failure)rethrow_exception(failure);
+  }
+  if(const char* p=std::getenv("SHOPPING_PROFILE"); p && *p=='1' && total_ucache_lookups.load()>0){
+    const uint64_t l=total_ucache_lookups.load();
+    const uint64_t h=total_ucache_hits.load();
+    cerr<<"PROFILE native_v67_user_cache_hits="<<h<<" lookups="<<l
+        <<" hit_rate="<<(static_cast<double>(h)/static_cast<double>(l))<<"\n";
   }
   profile("event_parse_parallel");
   ofstream so(argv[4],ios::binary);
