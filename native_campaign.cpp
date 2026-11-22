@@ -25,6 +25,9 @@ inline uint64_t fnv1a_64(std::string_view sv) {
         h ^= c;
         h *= 1099511628211ULL;
     }
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= (h >> 33);
     return h ? h : 1ULL;
 }
 
@@ -99,36 +102,39 @@ private:
     size_t size_ = 0;
 };
 
-class FlatClickIdSet {
+// Earliest-ingest-wins deduplication set using precomputed hash and contiguous arena.
+class FastEarliestDedupSet {
 public:
     void reserve(size_t expected_items, size_t expected_bytes) {
         size_t cap = 64;
-        while (cap < expected_items * 2) cap <<= 1;
+        while (cap < (expected_items * 4) / 3 + 16) cap <<= 1;
         slots_.assign(cap, Slot{});
         arena_.reserve(expected_bytes);
     }
 
-    bool insert_with_hash(std::string_view key, uint64_t h, uint32_t& out_off, uint32_t& out_len) {
-        if ((size_ + 1) * 10 >= slots_.size() * 7) {
+    // Preserves earliest-ingest-wins: returns true only on first occurrence of key.
+    bool try_insert_earliest(std::string_view key, uint64_t h, uint32_t& out_off, uint32_t& out_len) {
+        if ((size_ + 1) * 4 >= slots_.size() * 3) {
             rehash(slots_.empty() ? 64 : slots_.size() * 2);
         }
         const size_t mask = slots_.size() - 1;
         size_t idx = static_cast<size_t>(h) & mask;
         const char* base = arena_.data();
+        const uint32_t klen = static_cast<uint32_t>(key.size());
         while (true) {
             Slot& s = slots_[idx];
             if (s.hash == 0) {
                 out_off = static_cast<uint32_t>(arena_.size());
-                out_len = static_cast<uint32_t>(key.size());
-                arena_.insert(arena_.end(), key.data(), key.data() + key.size());
+                out_len = klen;
+                arena_.insert(arena_.end(), key.data(), key.data() + klen);
                 s.hash = h;
                 s.off = out_off;
-                s.len = out_len;
+                s.len = klen;
                 ++size_;
                 return true;
             }
-            if (s.hash == h && s.len == key.size() &&
-                std::memcmp(base + s.off, key.data(), s.len) == 0) {
+            if (s.hash == h && s.len == klen &&
+                (klen == 0 || std::memcmp(base + s.off, key.data(), klen) == 0)) {
                 return false;
             }
             idx = (idx + 1) & mask;
@@ -158,11 +164,22 @@ private:
     void rehash(size_t new_cap) {
         std::vector<Slot> next(new_cap);
         const size_t mask = new_cap - 1;
+        const char* base = arena_.data();
         for (const auto& s : slots_) {
             if (s.hash == 0) continue;
             size_t idx = static_cast<size_t>(s.hash) & mask;
-            while (next[idx].hash != 0) idx = (idx + 1) & mask;
-            next[idx] = s;
+            while (true) {
+                Slot& dst = next[idx];
+                if (dst.hash == 0) {
+                    dst = s;
+                    break;
+                }
+                if (dst.hash == s.hash && dst.len == s.len &&
+                    (s.len == 0 || std::memcmp(base + dst.off, base + s.off, s.len) == 0)) {
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
         }
         slots_.swap(next);
     }
@@ -482,7 +499,6 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
     std::vector<std::string> idx_to_day;
     idx_to_day.reserve(64);
 
-    // Pre-allocate raw_srefs and per-person counts to avoid mid-loop vector growth
     const size_t n_sess = sessions.size();
     std::vector<SessionRef> raw_srefs(n_sess);
     std::vector<uint32_t> person_sess_counts;
@@ -534,7 +550,6 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
 
     const uint32_t num_persons = static_cast<uint32_t>(person_sess_counts.size());
 
-    // Build prefix offsets in-place in person_sess_counts (size num_persons + 1)
     person_sess_counts.push_back(0);
     uint32_t running_off = 0;
     for (uint32_t p = 0; p < num_persons; ++p) {
@@ -600,7 +615,7 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
     const auto t_sess = std::chrono::steady_clock::now();
 
     const int64_t min_ts = window_start_ms - SEVEN_DAYS_MS;
-    FlatClickIdSet seen_click_ids;
+    FastEarliestDedupSet seen_click_ids;
     std::vector<ClickRec> raw_clicks;
     std::vector<uint32_t> person_click_counts(num_persons, 0);
 
@@ -710,7 +725,7 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             for (const auto& r : pf.rows) {
                 std::string_view cid_sv(base_ptr + r.cid_off, r.cid_len);
                 uint32_t arena_off = 0, arena_len = 0;
-                if (!seen_click_ids.insert_with_hash(cid_sv, r.cid_hash, arena_off, arena_len)) {
+                if (!seen_click_ids.try_insert_earliest(cid_sv, r.cid_hash, arena_off, arena_len)) {
                     continue;
                 }
                 if (r.valid) {
@@ -930,7 +945,7 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--bench") {
         const size_t n_sess = std::stoull(argv[2]);
         const size_t n_clicks = std::stoull(argv[3]);
-        const fs::path tmp = fs::temp_directory_path() / "campaign_bench_v48";
+        const fs::path tmp = fs::temp_directory_path() / "campaign_bench_v49";
         fs::create_directories(tmp / "clicks");
 
         {
@@ -945,7 +960,9 @@ int main(int argc, char** argv) {
             const size_t per_file = n_clicks / num_files;
             for (size_t i = 0; i < per_file; ++i) {
                 const size_t idx = static_cast<size_t>(f) * per_file + i;
-                clf << "ck_" << idx << ",u_" << (idx % (n_sess / 2)) << ",camp_" << ((idx % 50) + 1)
+                // Include 25% duplicate click_ids to exercise earliest-ingest-wins deduplication
+                const size_t cid_num = (i % 4 == 0) ? (idx / 2) : idx;
+                clf << "ck_" << cid_num << ",u_" << (idx % (n_sess / 2)) << ",camp_" << ((idx % 50) + 1)
                     << "," << (1760000000000LL + static_cast<int64_t>((idx % 86400) * 1000LL)) << "\n";
             }
         }
