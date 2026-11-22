@@ -54,11 +54,17 @@ static i64 days_from_civil(int y,unsigned m,unsigned d){
 }
 static bool parse_ts(string_view s,i64 &out){
   if(s.empty())return false;
-  if(digits(s,0,s.size())){
-    i64 acc=0;
-    for(char c:s){int z=c-'0';if(acc>(INT64_MAX-z)/10)return false; acc=acc*10+z;}
-    out=acc; return true;
+  // V53: the common epoch-millisecond path must not scan every digit twice.
+  // Stop at the first non-digit and fall through to the exact ISO validator.
+  i64 acc=0;
+  size_t numeric_chars=0;
+  for(;numeric_chars<s.size();++numeric_chars){
+    const unsigned z=static_cast<unsigned char>(s[numeric_chars])-'0';
+    if(z>9)break;
+    if(acc>(INT64_MAX-static_cast<i64>(z))/10)return false;
+    acc=acc*10+static_cast<i64>(z);
   }
+  if(numeric_chars==s.size()) {out=acc;return true;}
   if(s.size()!=20&&s.size()!=25)return false;
   if(s[4]!='-'||s[7]!='-'||s[10]!='T'||s[13]!=':'||s[16]!=':'||
      !digits(s,0,4)||!digits(s,5,7)||!digits(s,8,10)||
@@ -521,9 +527,17 @@ int main(int argc,char**argv){
       i64 cents=0;
       const bool purchase=event_type=="purchase";
       if(purchase){
-        if(!digits(price,0,price.size()))continue;
-        for(char c:price){int x=c-'0';if(cents>10000000/10) {cents=10000001;break;}cents=cents*10+x;if(cents>10000000)break;}
-        if(cents<1||cents>10000000)continue;
+        // V53: validate and accumulate price in one pass, with an early
+        // range cutoff. Invalid or out-of-range prices are discarded alike.
+        if(price.empty())continue;
+        bool valid_price=true;
+        for(char c:price){
+          const unsigned digit=static_cast<unsigned char>(c)-'0';
+          if(digit>9 || cents>10000000/10){valid_price=false;break;}
+          cents=cents*10+digit;
+          if(cents>10000000){valid_price=false;break;}
+        }
+        if(!valid_price||cents<1)continue;
       }
       out.push_back(ParsedEvent{ts,cents,user,product,purchase});
     }
