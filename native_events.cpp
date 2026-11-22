@@ -16,6 +16,8 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <sstream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -501,8 +503,9 @@ int main(int argc,char**argv){
   // Counting-distribute by canonical person (already assigned lexicographic
   // ranks), then sort timestamps only inside each person's contiguous span.
   // This avoids millions of cross-person comparisons in the global sort.
+  vector<size_t> person_ends(sorted_people.size()+1,0);
   if(!events.empty()){
-    vector<size_t> ends(sorted_people.size()+1,0);
+    auto &ends=person_ends;
     for(const Event &e:events)++ends[static_cast<size_t>(e.person)+1];
     for(size_t i=1;i<ends.size();++i)ends[i]+=ends[i-1];
     vector<size_t> write_pos=ends;
@@ -520,15 +523,119 @@ int main(int argc,char**argv){
   ofstream so(argv[4],ios::binary);
   ofstream uo(argv[3],ios::binary);
   if(!so||!uo)throw runtime_error("output not writable");
+  vector<native_campaign::CampaignSession> campaign_sessions;
+  i64 session_count=0, daily_count=0;
+  // V34: each worker owns whole canonical-person ranges. All output stays
+  // ordered by lexicographic person via deterministic ordered concatenation.
+  // Legacy argc==5 output retains its global session numbering unchanged.
+  if(argc==6 && thread_count>1 && sorted_people.size()>1000){
+    struct Block {
+      string users_json;
+      vector<native_campaign::CampaignSession> sessions;
+      i64 session_count=0, daily_count=0;
+    };
+    const size_t worker_count=min<size_t>(thread_count,sorted_people.size());
+    vector<size_t> boundaries(worker_count+1,0);
+    // Balance by *event count*, not by user count. Respect person boundaries.
+    for(size_t w=1;w<worker_count;++w){
+      size_t target=(events.size()*w)/worker_count;
+      auto it=lower_bound(person_ends.begin(),person_ends.end(),target);
+      boundaries[w]=static_cast<size_t>(it-person_ends.begin());
+    }
+    boundaries[worker_count]=sorted_people.size();
+    vector<Block> blocks(worker_count);
+    atomic<size_t> next_block{0};
+    exception_ptr error;
+    mutex error_lock;
+    auto process_block=[&](size_t bi){
+      Block &out=blocks[bi];
+      ostringstream users;
+      Session cur;
+      Daily daily;
+      bool have_session=false,have_daily=false;
+      i64 prev=0;
+      uint32_t last_person=UINT32_MAX;
+      auto flush_daily=[&](){
+        if(!have_daily)return;
+        string best;bool has=false;i64 bestsum=0;
+        for(const auto &kv:daily.categories)
+          if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
+            best=kv.first;bestsum=kv.second;has=true;
+          }
+        users<<"{\"user_id\":"<<json_escape(daily.person)<<",\"day\":"<<json_escape(daily.day)
+          <<",\"sessions\":"<<daily.sessions<<",\"events\":"<<daily.events
+          <<",\"revenue_cents\":"<<daily.revenue<<",\"top_category\":"
+          <<(has?json_escape(best):"null")<<"}\n";
+        ++out.daily_count;
+      };
+      auto flush_session=[&](){
+        if(!have_session)return;
+        ++out.session_count;
+        out.sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
+        if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
+          flush_daily();
+          daily=Daily{cur.person,cur.day};
+          have_daily=true;
+        }
+        daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
+        for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
+      };
+      const size_t first=person_ends[boundaries[bi]],last=person_ends[boundaries[bi+1]];
+      out.sessions.reserve((last-first)/5);
+      for(size_t k=first;k<last;++k){
+        const Event &e=events[k];
+        if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+          flush_session();
+          cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
+          have_session=true;
+        }
+        ++cur.events;
+        if(e.purchase){
+          cur.purchased=true;cur.revenue+=e.cents;
+          cur.category_revenue[category_names[e.category]]+=e.cents;
+        }
+        prev=e.ts;last_person=e.person;
+      }
+      flush_session();flush_daily();
+      out.users_json=users.str();
+    };
+    auto worker=[&](){
+      try{
+        for(;;){
+          const size_t b=next_block.fetch_add(1,memory_order_relaxed);
+          if(b>=worker_count)break;
+          process_block(b);
+        }
+      }catch(...){
+        lock_guard<mutex> guard(error_lock);
+        if(!error)error=current_exception();
+      }
+    };
+    vector<thread> workers;
+    for(size_t i=0;i<worker_count;++i)workers.emplace_back(worker);
+    for(auto &t:workers)t.join();
+    if(error)rethrow_exception(error);
+    size_t total_campaign_sessions=0;
+    for(const auto &b:blocks)total_campaign_sessions+=b.sessions.size();
+    campaign_sessions.reserve(total_campaign_sessions);
+    for(auto &b:blocks){
+      uo.write(b.users_json.data(),static_cast<streamsize>(b.users_json.size()));
+      session_count+=b.session_count;
+      daily_count+=b.daily_count;
+      campaign_sessions.insert(campaign_sessions.end(),
+        make_move_iterator(b.sessions.begin()),make_move_iterator(b.sessions.end()));
+      b.users_json.clear();b.sessions.clear();
+    }
+  }else{
+
   // Stream finished sessions and user-day rows immediately instead of retaining
   // millions of session objects. Input is ordered by canonical person + time,
   // so days are monotone within a person.
   Session cur;
-  vector<native_campaign::CampaignSession> campaign_sessions;
   if(argc==6) campaign_sessions.reserve(events.size()/5);
   Daily daily;
   bool have_session=false, have_daily=false;
-  i64 prev=0, session_count=0, daily_count=0;
+  i64 prev=0;
   uint32_t last_person=UINT32_MAX;
   auto flush_daily=[&](){
     if(!have_daily)return;
@@ -579,6 +686,8 @@ int main(int argc,char**argv){
     prev=e.ts;last_person=e.person;
   }
   flush_session();flush_daily();
+
+  }
   so.close();uo.close();
   profile("sessionize_and_json_output");
   if(argc==6){
