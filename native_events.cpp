@@ -389,7 +389,44 @@ int main(int argc,char**argv){
   // Cache canonical numeric IDs by original raw user ID. The keys borrow
   // stable bytes from the read-only event mmaps, which outlive validation.
   // Repeated users bypass BOTH identity-map and person-interning lookups.
-  unordered_map<string_view,uint32_t> raw_user_cache;
+  // V36 experiment: contiguous open-addressing cache for raw user IDs.
+  // Keys borrow mapped CSV bytes and remain alive until the cache is cleared.
+  struct FlatUserCache {
+    struct Entry { string_view key; uint32_t value; size_t hash_code; };
+    vector<Entry> entries;
+    vector<uint32_t> slots;
+    void rehash_to(size_t capacity){
+      vector<uint32_t> next(capacity,0);
+      for(size_t i=0;i<entries.size();++i){
+        size_t pos=(entries[i].hash_code>>3)&(capacity-1);
+        while(next[pos])pos=(pos+1)&(capacity-1);
+        next[pos]=static_cast<uint32_t>(i+1);
+      }
+      slots.swap(next);
+    }
+    pair<uint32_t*,bool> try_emplace(string_view key,uint32_t initial){
+      if(slots.empty())rehash_to(1024);
+      const size_t h=hash<string_view>{}(key);
+      size_t pos=(h>>3)&(slots.size()-1);
+      while(slots[pos]){
+        Entry &e=entries[slots[pos]-1];
+        if(e.hash_code==h && e.key==key)return {&e.value,false};
+        pos=(pos+1)&(slots.size()-1);
+      }
+      if(entries.size()==UINT32_MAX)throw runtime_error("too many users");
+      // Rehash before inserting, so existing pointers are never reused after a grow.
+      if((entries.size()+1)*10>=slots.size()*7){
+        rehash_to(slots.size()*2);
+        pos=(h>>3)&(slots.size()-1);
+        while(slots[pos])pos=(pos+1)&(slots.size()-1);
+      }
+      entries.push_back(Entry{key,initial,h});
+      slots[pos]=static_cast<uint32_t>(entries.size());
+      return {&entries.back().value,true};
+    }
+    void clear(){vector<Entry>().swap(entries);vector<uint32_t>().swap(slots);}
+  };
+  FlatUserCache raw_user_cache;
   vector<string> people;
   unordered_map<string,uint32_t> category_ids;
   // Purchase product IDs are also repeated; resolve their category only once.
@@ -465,7 +502,7 @@ int main(int argc,char**argv){
       string person_name=id==ids.end()?string(p.user):id->second;
       auto [person_it,inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
       if(inserted)people.push_back(std::move(person_name));
-      raw_it->second=person_it->second;
+      *raw_it=person_it->second;
     }
     uint32_t cat_id=0;
     if(p.purchase){
@@ -477,11 +514,11 @@ int main(int argc,char**argv){
       }
       cat_id=cat_cached->second;
     }
-    events.push_back(Event{p.ts,p.cents,raw_it->second,cat_id,p.purchase});
+    events.push_back(Event{p.ts,p.cents,*raw_it,cat_id,p.purchase});
   }
   vector<vector<ParsedEvent>>().swap(parsed);
   // Drop borrowed-key caches before the underlying mappings are released.
-  raw_user_cache.clear();raw_user_cache.rehash(0);
+  raw_user_cache.clear();
   product_category_cache.clear();product_category_cache.rehash(0);
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
