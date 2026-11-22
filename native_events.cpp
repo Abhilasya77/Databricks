@@ -465,9 +465,19 @@ int main(int argc,char**argv){
       slots[pos]=static_cast<uint32_t>(entries.size());
       return {&entries.back().value,true};
     }
+    void reserve(size_t expected){
+      entries.reserve(expected);
+      size_t cap=1024;
+      while(cap<expected*2 && cap<(size_t(1)<<31))cap*=2;
+      rehash_to(cap);
+    }
     void clear(){vector<Entry>().swap(entries);vector<uint32_t>().swap(slots);}
   };
   FlatUserCache raw_user_cache;
+  // V48: allocate the intern cache once, rather than repeatedly growing and
+  // rehashing millions of user keys during the serial conversion pass.
+  // Cap the hint to avoid excessive memory use on high-cardinality fixtures.
+  raw_user_cache.reserve(min<size_t>(n_raw / 8, 1500000));
   vector<string> people;
   unordered_map<string,uint32_t> category_ids;
   // Purchase product IDs are also repeated; resolve their category only once.
@@ -535,6 +545,7 @@ int main(int argc,char**argv){
     if(failure)rethrow_exception(failure);
   }
   profile("event_parse_parallel");
+  const auto intern_start=chrono::steady_clock::now();
   // Preserve the baseline's single-threaded person/category interning order.
   for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
     auto [raw_it,raw_inserted]=raw_user_cache.try_emplace(p.user,0U);
@@ -562,6 +573,10 @@ int main(int argc,char**argv){
   // Drop borrowed-key caches before the underlying mappings are released.
   raw_user_cache.clear();
   product_category_cache.clear();product_category_cache.rehash(0);
+  if(const char *p=getenv("SHOPPING_PROFILE");p && *p=='1'){
+    cerr<<"PROFILE native_event_intern_and_release_seconds="
+        <<chrono::duration<double>(chrono::steady_clock::now()-intern_start).count()<<"\n";
+  }
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
   for(auto &shard:shards){shard.rows.clear();}
