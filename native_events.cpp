@@ -477,7 +477,11 @@ int main(int argc,char**argv){
   // V48: allocate the intern cache once, rather than repeatedly growing and
   // rehashing millions of user keys during the serial conversion pass.
   // Cap the hint to avoid excessive memory use on high-cardinality fixtures.
-  raw_user_cache.reserve(min<size_t>(n_raw / 8, 1500000));
+  // V49 experiment: reduce large raw-user cache rehash passes on datasets
+  // containing millions of distinct users. Open addressing requires slack;
+  // this is a capacity hint only and does not change key/winner semantics.
+  // The cap keeps the up-front allocation bounded on very large inputs.
+  raw_user_cache.reserve(min<size_t>(n_raw / 4, 5000000));
   vector<string> people;
   unordered_map<string,uint32_t> category_ids;
   // Purchase product IDs are also repeated; resolve their category only once.
@@ -569,13 +573,19 @@ int main(int argc,char**argv){
     }
     events.push_back(Event{p.ts,p.cents,*raw_it,cat_id,p.purchase});
   }
+  const auto intern_complete=chrono::steady_clock::now();
   vector<vector<ParsedEvent>>().swap(parsed);
   // Drop borrowed-key caches before the underlying mappings are released.
   raw_user_cache.clear();
   product_category_cache.clear();product_category_cache.rehash(0);
+  const auto release_complete=chrono::steady_clock::now();
   if(const char *p=getenv("SHOPPING_PROFILE");p && *p=='1'){
+    cerr<<"PROFILE native_event_intern_only_seconds="
+        <<chrono::duration<double>(intern_complete-intern_start).count()<<"\n";
+    cerr<<"PROFILE native_event_release_only_seconds="
+        <<chrono::duration<double>(release_complete-intern_complete).count()<<"\n";
     cerr<<"PROFILE native_event_intern_and_release_seconds="
-        <<chrono::duration<double>(chrono::steady_clock::now()-intern_start).count()<<"\n";
+        <<chrono::duration<double>(release_complete-intern_start).count()<<"\n";
   }
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
