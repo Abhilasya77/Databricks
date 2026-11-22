@@ -550,15 +550,17 @@ int main(int argc,char**argv){
     }
   };
 
-  // V64: Partition-local interning + sessionization in direct_parquet mode.
+  // V65: 32-byte packed PersonEvent for partition-local interning + sessionization.
   constexpr size_t PERSON_PARTS=64;
+  static constexpr uint32_t PE_PURCHASE_BIT = 1U << 31;
+  static constexpr uint32_t PE_CAT_MASK     = PE_PURCHASE_BIT - 1U;
   struct PersonEvent {
     i64 ts;
-    i64 cents;
     string_view person;
-    uint32_t category;
-    bool purchase;
+    uint32_t cents;
+    uint32_t cat_flags; // bit 31 = purchase, bits 0..30 = category id
   };
+  static_assert(sizeof(PersonEvent) == 32);
   const size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
   vector<vector<vector<PersonEvent>>> person_buckets;
   if(direct_parquet){
@@ -608,7 +610,7 @@ int main(int argc,char**argv){
           cat_id=(cit==product_cat_id.end())?unknown_cat_id:cit->second;
         }
         const size_t ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
-        person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,cents,person,cat_id,purchase});
+        person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,person,static_cast<uint32_t>(cents),cat_id|(purchase?PE_PURCHASE_BIT:0U)});
       }else{
         out_parsed->push_back(ParsedEvent{ts,cents,user,product,purchase});
       }
@@ -665,33 +667,83 @@ int main(int argc,char**argv){
         PartOut &out=pouts[tid];
         native_parquet::UserDailyParquetWriter parquet(
           (fs::path(argv[6])/"user_daily"/("part-"+to_string(tid)+".parquet")).string());
-        unordered_map<string_view,uint32_t> local_pids;
-        vector<string_view> local_people;
+        // V65: Reusable flat open-addressing person interner (zero node allocations)
+        struct LocalPersonTable {
+          vector<uint32_t> slots;
+          vector<uint64_t> hashes;
+          vector<string_view> people;
+          void reset(size_t expected){
+            size_t cap=256;
+            while(cap<expected*2)cap<<=1;
+            slots.assign(cap,0);
+            hashes.clear(); hashes.reserve(expected);
+            people.clear(); people.reserve(expected);
+          }
+          void rehash(size_t cap){
+            vector<uint32_t> next(cap,0);
+            const size_t mask=cap-1;
+            for(size_t i=0;i<people.size();++i){
+              size_t pos=(hashes[i]>>6)&mask;
+              while(next[pos])pos=(pos+1)&mask;
+              next[pos]=static_cast<uint32_t>(i+1);
+            }
+            slots.swap(next);
+          }
+          uint32_t intern(string_view s){
+            if((people.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
+            const uint64_t h=fast_hash_sv(s);
+            const size_t mask=slots.size()-1;
+            size_t pos=(h>>6)&mask;
+            while(uint32_t idx=slots[pos]){
+              const uint32_t id=idx-1;
+              if(hashes[id]==h && people[id]==s)return id;
+              pos=(pos+1)&mask;
+            }
+            const uint32_t id=static_cast<uint32_t>(people.size());
+            people.push_back(s);
+            hashes.push_back(h);
+            slots[pos]=id+1;
+            return id;
+          }
+        } lp_tbl;
+
+        // Per-worker day_num -> YYYY-MM-DD cache (dataset spans ~30-90 days)
+        unordered_map<int32_t,string> day_str_cache;
+        auto get_day_str=[&](int32_t dnum, i64 ts)->const string&{
+          auto it=day_str_cache.find(dnum);
+          if(it!=day_str_cache.end())return it->second;
+          return day_str_cache.emplace(dnum,day_string(ts)).first->second;
+        };
+
         vector<Event> local_events;
         vector<Event> local_grouped;
         vector<size_t> local_ends;
         vector<size_t> local_write;
+        vector<pair<uint32_t,i64>> cur_cats;
+        vector<pair<uint32_t,i64>> daily_cats;
+        cur_cats.reserve(16);
+        daily_cats.reserve(16);
+
         for(;;){
           const size_t part=next_part.fetch_add(1,memory_order_relaxed);
           if(part>=PERSON_PARTS)break;
           size_t total_ev=0;
           for(size_t w=0;w<validation_threads;++w)total_ev+=person_buckets[w][part].size();
           if(total_ev==0)continue;
-          local_pids.clear();
-          local_people.clear();
+          lp_tbl.reset(total_ev/4+64);
           local_events.clear();
           local_events.reserve(total_ev);
-          local_pids.reserve(total_ev/4+64);
           for(size_t w=0;w<validation_threads;++w){
             auto &b=person_buckets[w][part];
             for(const PersonEvent &pe:b){
-              auto [it,ins]=local_pids.try_emplace(pe.person,static_cast<uint32_t>(local_people.size()));
-              if(ins)local_people.push_back(pe.person);
-              local_events.push_back(Event{pe.ts,pe.cents,it->second,pe.category,pe.purchase});
+              const uint32_t pid=lp_tbl.intern(pe.person);
+              local_events.push_back(Event{
+                  pe.ts, static_cast<i64>(pe.cents), pid,
+                  pe.cat_flags&PE_CAT_MASK, (pe.cat_flags&PE_PURCHASE_BIT)!=0});
             }
             vector<PersonEvent>().swap(b);
           }
-          const size_t np=local_people.size();
+          const size_t np=lp_tbl.people.size();
           local_ends.assign(np+1,0);
           for(const Event &e:local_events)++local_ends[static_cast<size_t>(e.person)+1];
           for(size_t i=1;i<=np;++i)local_ends[i]+=local_ends[i-1];
@@ -699,56 +751,78 @@ int main(int argc,char**argv){
           local_grouped.resize(local_events.size());
           for(const Event &e:local_events)local_grouped[local_write[e.person]++]=e;
 
-          Session cur;
-          Daily daily;
-          bool have_session=false, have_daily=false;
-          i64 prev=0;
-          uint32_t last_person=UINT32_MAX;
-          auto flush_daily=[&](){
-            if(!have_daily)return;
-            string best;bool has=false;i64 bestsum=0;
-            for(const auto &kv:daily.categories)
-              if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
-                best=kv.first;bestsum=kv.second;has=true;
-              }
-            parquet.write_row(daily.person,native_parquet::parse_date_days(daily.day),
-              daily.sessions,daily.events,daily.revenue,best,!has);
-            ++out.daily_count;
+          auto add_cat=[](vector<pair<uint32_t,i64>> &v, uint32_t cid, i64 rev){
+            for(auto &kv:v){ if(kv.first==cid){ kv.second+=rev; return; } }
+            v.emplace_back(cid,rev);
           };
-          auto flush_session=[&](){
-            if(!have_session)return;
-            ++out.session_count;
-            out.sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
-            if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
-              flush_daily();
-              daily=Daily{cur.person,cur.day};
-              have_daily=true;
-            }
-            daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
-            for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
-          };
+
           for(size_t pid=0;pid<np;++pid){
             const size_t from=local_ends[pid], to=local_ends[pid+1];
+            if(from==to)continue;
             if(to-from>1)
               sort(local_grouped.begin()+from,local_grouped.begin()+to,
                    [](const Event&a,const Event&b){return a.ts<b.ts;});
-            const string person_str(local_people[pid]);
+            const string person_str(lp_tbl.people[pid]);
+
+            bool have_session=false, have_daily=false;
+            i64 prev=0, cur_start=0, cur_events=0, cur_rev=0;
+            int32_t cur_day=0, daily_day=0;
+            bool cur_purchased=false;
+            i64 daily_sessions=0, daily_events=0, daily_rev=0;
+            cur_cats.clear();
+            daily_cats.clear();
+
+            auto flush_daily=[&](){
+              if(!have_daily)return;
+              uint32_t best_id=0; bool has=false; i64 bestsum=0;
+              for(const auto &kv:daily_cats){
+                if(!has||kv.second>bestsum||
+                   (kv.second==bestsum&&category_names[kv.first]<category_names[best_id])){
+                  best_id=kv.first; bestsum=kv.second; has=true;
+                }
+              }
+              static const string empty_str;
+              parquet.write_row(person_str, daily_day,
+                daily_sessions, daily_events, daily_rev,
+                has?category_names[best_id]:empty_str, !has);
+              ++out.daily_count;
+              daily_cats.clear();
+            };
+            auto flush_session=[&](){
+              if(!have_session)return;
+              ++out.session_count;
+              out.sessions.push_back(native_campaign::CampaignSession{
+                  person_str, get_day_str(cur_day, cur_start), cur_start, cur_rev, cur_purchased});
+              if(!have_daily||daily_day!=cur_day){
+                flush_daily();
+                daily_day=cur_day;
+                daily_sessions=0; daily_events=0; daily_rev=0;
+                have_daily=true;
+              }
+              ++daily_sessions; daily_events+=cur_events; daily_rev+=cur_rev;
+              for(const auto &c:cur_cats)add_cat(daily_cats, c.first, c.second);
+              cur_cats.clear();
+            };
+
             for(size_t k=from;k<to;++k){
               const Event &e=local_grouped[k];
-              if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+              if(!have_session||e.ts-prev>GAP_MS){
                 flush_session();
-                cur=Session{person_str,day_string(e.ts),e.ts};
+                cur_start=e.ts;
+                cur_day=static_cast<int32_t>(e.ts>=0?(e.ts/DAY_MS):((e.ts-DAY_MS+1)/DAY_MS));
+                cur_events=0; cur_rev=0; cur_purchased=false;
                 have_session=true;
               }
-              ++cur.events;
+              ++cur_events;
               if(e.purchase){
-                cur.purchased=true;cur.revenue+=e.cents;
-                cur.category_revenue[category_names[e.category]]+=e.cents;
+                cur_purchased=true; cur_rev+=e.cents;
+                add_cat(cur_cats, e.category, e.cents);
               }
-              prev=e.ts;last_person=e.person;
+              prev=e.ts;
             }
+            flush_session();
+            flush_daily();
           }
-          flush_session();flush_daily();
         }
         parquet.finish();
       }catch(...){
