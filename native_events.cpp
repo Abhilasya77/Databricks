@@ -300,7 +300,16 @@ int main(int argc,char**argv){
   const size_t hint_per_shard=min<size_t>(250000,static_cast<size_t>(estimated_bytes/150/SHARD_COUNT));
   for(auto &shard:shards)shard.rows.reserve(hint_per_shard);
 
+  // V40: buffer candidate rows by their destination shard. A worker obtains
+  // one lock per populated shard per task instead of one lock per event.
+  // Winner selection is order-independent: minimum lexicographic ingest value.
+  struct Candidate {
+    string_view id;
+    Raw raw;
+    size_t hash_code;
+  };
   auto read_task=[&](const Task &task){
+    array<vector<Candidate>,SHARD_COUNT> staged;
     const MappedFile &f=*task.file;
     const char *const base=f.data;
     const size_t file_end=f.size;
@@ -328,17 +337,25 @@ int main(int argc,char**argv){
         const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
         const uint32_t il=static_cast<uint32_t>(fields[3].size());
         const size_t idhash=hash<string_view>{}(fields[0]);
-        Shard &shard=shards[idhash&(SHARD_COUNT-1)];
-        lock_guard<mutex> guard(shard.lock);
-        auto [it,inserted]=shard.rows.try_emplace(fields[0],idhash);
-        if(inserted)it->second=Raw{line,ip,il};
-        else{
-          Raw &prev=it->second;
-          if(fields[3]<string_view(prev.line.data()+prev.ingest_pos,prev.ingest_len))
-            prev=Raw{line,ip,il};
-        }
+        staged[idhash&(SHARD_COUNT-1)].push_back(Candidate{fields[0],Raw{line,ip,il},idhash});
       }
       start=stop+static_cast<size_t>(!!lf);
+    }
+    for(size_t shard_id=0;shard_id<SHARD_COUNT;++shard_id){
+      auto &batch=staged[shard_id];
+      if(batch.empty())continue;
+      Shard &shard=shards[shard_id];
+      lock_guard<mutex> guard(shard.lock);
+      for(const Candidate &c:batch){
+        auto [it,inserted]=shard.rows.try_emplace(c.id,c.hash_code);
+        if(inserted)it->second=c.raw;
+        else {
+          Raw &prev=it->second;
+          const string_view prev_ingest(prev.line.data()+prev.ingest_pos,prev.ingest_len);
+          const string_view candidate_ingest(c.raw.line.data()+c.raw.ingest_pos,c.raw.ingest_len);
+          if(candidate_ingest<prev_ingest)prev=c.raw;
+        }
+      }
     }
   };
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
