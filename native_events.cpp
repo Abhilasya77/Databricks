@@ -652,68 +652,84 @@ int main(int argc,char**argv){
   profile("event_validate");
   // Release the dedup payloads before sorting compact events.
   worker_buckets.clear();
-  // Assign each person a lexicographic rank so the global sort compares
-  // integers, not UTF-8 strings, for every event comparison.
-  vector<uint32_t> order(people.size());
-  iota(order.begin(),order.end(),0U);
-  sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b){return people[a]<people[b];});
-  vector<uint32_t> rank(people.size());
-  vector<string> sorted_people(people.size());
-  for(size_t i=0;i<order.size();++i){
-    rank[order[i]]=static_cast<uint32_t>(i);
-    sorted_people[i]=move(people[order[i]]);
+  // V63: In direct-Parquet mode, skip lexicographic person sorting and the
+  // 22.6M-row person-rank remap pass; keep canonical person IDs in interned
+  // order. Preserve exact lexicographic ranking for legacy JSONL / argc==5.
+  vector<string> sorted_people;
+  if(direct_parquet){
+    sorted_people=move(people);
+  }else{
+    vector<uint32_t> order(people.size());
+    iota(order.begin(),order.end(),0U);
+    sort(order.begin(),order.end(),[&](uint32_t a,uint32_t b){return people[a]<people[b];});
+    vector<uint32_t> rank(people.size());
+    sorted_people.resize(people.size());
+    for(size_t i=0;i<order.size();++i){
+      rank[order[i]]=static_cast<uint32_t>(i);
+      sorted_people[i]=move(people[order[i]]);
+    }
+    for(auto &e:events)e.person=rank[e.person];
+    vector<string>().swap(people);
   }
-  for(auto &e:events)e.person=rank[e.person];
-  vector<string>().swap(people);
   person_ids.clear();
-  // Counting-distribute by canonical person (already assigned lexicographic
-  // ranks), then sort timestamps only inside each person's contiguous span.
-  // This avoids millions of cross-person comparisons in the global sort.
-  vector<size_t> person_ends(sorted_people.size()+1,0);
+
+  // V63: Parallel lock-free counting-distribute by canonical person ID.
+  // Per-person timestamp sorting is fused directly into sessionization below
+  // so each person's event span is sorted in L1 cache right before consumption.
+  const size_t num_people=sorted_people.size();
+  vector<size_t> person_ends(num_people+1,0);
   if(!events.empty()){
     auto &ends=person_ends;
-    for(const Event &e:events)++ends[static_cast<size_t>(e.person)+1];
-    for(size_t i=1;i<ends.size();++i)ends[i]+=ends[i-1];
-    vector<size_t> write_pos=ends;
-    vector<Event> grouped(events.size());
-    for(const Event &e:events)grouped[write_pos[e.person]++]=e;
-    events.swap(grouped);
-    // V46: person ranges are independent; sort their timestamps concurrently.
-    // Each worker touches disjoint spans, so neither locks nor a merge are needed.
-    // Preserve std::sort comparator and per-person grouping semantics.
-    auto sort_people_range=[&](size_t from_person,size_t to_person){
-      for(size_t i=from_person;i<to_person;++i){
-        const size_t from=ends[i], to=ends[i+1];
-        if(to-from>1)
-          sort(events.begin()+from,events.begin()+to,
-               [](const Event&a,const Event&b){return a.ts<b.ts;});
-      }
-    };
-    if(thread_count>1 && events.size()>=200000 && sorted_people.size()>=1000){
-      // Dynamic batches avoid imbalanced work when some people have many events.
-      constexpr size_t PERSON_BATCH=256;
-      atomic<size_t> next_person{0};
-      exception_ptr failure;
-      mutex failure_lock;
-      auto sort_worker=[&](){
-        try{
-          for(;;){
-            const size_t from=next_person.fetch_add(PERSON_BATCH,memory_order_relaxed);
-            if(from>=sorted_people.size())break;
-            sort_people_range(from,min(from+PERSON_BATCH,sorted_people.size()));
-          }
-        }catch(...){
-          lock_guard<mutex> guard(failure_lock);
-          if(!failure)failure=current_exception();
-        }
-      };
+    const size_t max_hist_threads=num_people?max<size_t>(1,(32ULL*1024*1024)/num_people):1;
+    const size_t dist_threads=min<size_t>(thread_count,max_hist_threads);
+    if(dist_threads>1 && events.size()>=200000 && num_people>0){
+      const size_t n=events.size();
+      vector<vector<uint32_t>> local_counts(dist_threads,vector<uint32_t>(num_people,0));
       vector<thread> workers;
-      workers.reserve(thread_count);
-      for(size_t i=0;i<thread_count;++i)workers.emplace_back(sort_worker);
-      for(auto &t:workers)t.join();
-      if(failure)rethrow_exception(failure);
+      workers.reserve(dist_threads);
+      for(size_t t=0;t<dist_threads;++t){
+        const size_t b=(n*t)/dist_threads, e=(n*(t+1))/dist_threads;
+        workers.emplace_back([&,t,b,e](){
+          auto &cnt=local_counts[t];
+          for(size_t i=b;i<e;++i)++cnt[events[i].person];
+        });
+      }
+      for(auto &w:workers)w.join();
+      workers.clear();
+
+      // Compute global person_ends and disjoint per-thread write offsets.
+      vector<vector<size_t>> local_off(dist_threads,vector<size_t>(num_people,0));
+      size_t running=0;
+      for(size_t p=0;p<num_people;++p){
+        ends[p]=running;
+        for(size_t t=0;t<dist_threads;++t){
+          local_off[t][p]=running;
+          running+=local_counts[t][p];
+        }
+      }
+      ends[num_people]=running;
+      local_counts.clear();
+
+      vector<Event> grouped(n);
+      for(size_t t=0;t<dist_threads;++t){
+        const size_t b=(n*t)/dist_threads, e=(n*(t+1))/dist_threads;
+        workers.emplace_back([&,t,b,e](){
+          auto &off=local_off[t];
+          for(size_t i=b;i<e;++i){
+            const Event &ev=events[i];
+            grouped[off[ev.person]++]=ev;
+          }
+        });
+      }
+      for(auto &w:workers)w.join();
+      events.swap(grouped);
     }else{
-      sort_people_range(0,sorted_people.size());
+      for(const Event &e:events)++ends[static_cast<size_t>(e.person)+1];
+      for(size_t i=1;i<ends.size();++i)ends[i]+=ends[i-1];
+      vector<size_t> write_pos=ends;
+      vector<Event> grouped(events.size());
+      for(const Event &e:events)grouped[write_pos[e.person]++]=e;
+      events.swap(grouped);
     }
   }
   profile("event_sort");
@@ -785,21 +801,28 @@ int main(int argc,char**argv){
         daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
         for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
       };
-      const size_t first=person_ends[boundaries[bi]],last=person_ends[boundaries[bi+1]];
+      const size_t p_from=boundaries[bi], p_to=boundaries[bi+1];
+      const size_t first=person_ends[p_from], last=person_ends[p_to];
       out.sessions.reserve((last-first)/5);
-      for(size_t k=first;k<last;++k){
-        const Event &e=events[k];
-        if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
-          flush_session();
-          cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
-          have_session=true;
+      for(size_t p=p_from;p<p_to;++p){
+        const size_t from=person_ends[p], to=person_ends[p+1];
+        if(to-from>1)
+          sort(events.begin()+from,events.begin()+to,
+               [](const Event&a,const Event&b){return a.ts<b.ts;});
+        for(size_t k=from;k<to;++k){
+          const Event &e=events[k];
+          if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+            flush_session();
+            cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
+            have_session=true;
+          }
+          ++cur.events;
+          if(e.purchase){
+            cur.purchased=true;cur.revenue+=e.cents;
+            cur.category_revenue[category_names[e.category]]+=e.cents;
+          }
+          prev=e.ts;last_person=e.person;
         }
-        ++cur.events;
-        if(e.purchase){
-          cur.purchased=true;cur.revenue+=e.cents;
-          cur.category_revenue[category_names[e.category]]+=e.cents;
-        }
-        prev=e.ts;last_person=e.person;
       }
       flush_session();flush_daily();
       if(parquet)parquet->finish();
@@ -886,18 +909,25 @@ int main(int argc,char**argv){
     daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
     for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
   };
-  for(const Event &e:events){
-    if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
-      flush_session();
-      cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
-      have_session=true;
+  for(size_t p=0;p<sorted_people.size();++p){
+    const size_t from=person_ends[p], to=person_ends[p+1];
+    if(to-from>1)
+      sort(events.begin()+from,events.begin()+to,
+           [](const Event&a,const Event&b){return a.ts<b.ts;});
+    for(size_t k=from;k<to;++k){
+      const Event &e=events[k];
+      if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+        flush_session();
+        cur=Session{sorted_people[e.person],day_string(e.ts),e.ts};
+        have_session=true;
+      }
+      ++cur.events;
+      if(e.purchase){
+        cur.purchased=true;cur.revenue+=e.cents;
+        cur.category_revenue[category_names[e.category]]+=e.cents;
+      }
+      prev=e.ts;last_person=e.person;
     }
-    ++cur.events;
-    if(e.purchase){
-      cur.purchased=true;cur.revenue+=e.cents;
-      cur.category_revenue[category_names[e.category]]+=e.cents;
-    }
-    prev=e.ts;last_person=e.person;
   }
   flush_session();flush_daily();
   if(parquet)parquet->finish();
