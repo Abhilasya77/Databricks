@@ -326,13 +326,15 @@ int main(int argc,char**argv){
   //    open-addressed table (preserving exact smallest lexicographic ingest_ts),
   //    and immediately validates winners into parsed[part].
   constexpr size_t SHARD_COUNT=64;
+  // V59: 24-byte CompactRow storing 6 comma offsets for short unquoted rows
+  // (line_len < 255, no '"'). Sentinel c[0] == 255 falls back to parse_event_views.
   struct CompactRow {
     const char *line_ptr;
-    uint32_t line_len;
-    uint16_t id_off, id_len;
-    uint16_t ing_off, ing_len;
     uint64_t hash_code;
+    uint8_t c[6];
+    uint16_t line_len;
   };
+  static_assert(sizeof(CompactRow) == 24);
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
   if(const char* cpus=getenv("NCPU")){
     char *stop=nullptr;
@@ -375,16 +377,32 @@ int main(int argc,char**argv){
     while(start<task.end && start<file_end){
       const void *lf=memchr(base+start,'\n',file_end-start);
       const size_t stop=lf?static_cast<const char*>(lf)-base:file_end;
-      const string_view line(base+start,stop-start);
-      if(parse_event_views(line,fields)&&!fields[0].empty()){
-        const uint64_t h=fast_hash_sv(fields[0]);
-        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-line.data());
-        const uint16_t id_len=static_cast<uint16_t>(fields[0].size());
-        const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-line.data());
-        const uint16_t ing_len=static_cast<uint16_t>(fields[3].size());
-        local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
-            line.data(), static_cast<uint32_t>(line.size()),
-            id_off, id_len, ing_off, ing_len, h});
+      const char *lptr=base+start;
+      const size_t llen=stop-start;
+      if(llen>0 && llen<255 && !memchr(lptr,'"',llen)){
+        uint8_t c[6];
+        size_t pos=0;
+        bool ok=true;
+        for(size_t i=0;i<6;++i){
+          const void *cm=memchr(lptr+pos,',',llen-pos);
+          if(!cm){ok=false;break;}
+          const size_t idx=static_cast<const char*>(cm)-lptr;
+          c[i]=static_cast<uint8_t>(idx);
+          pos=idx+1;
+        }
+        if(ok && c[0]>0 && !memchr(lptr+pos,',',llen-pos)){
+          const uint64_t h=fast_hash_sv(string_view(lptr,c[0]));
+          local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+              lptr, h, {c[0],c[1],c[2],c[3],c[4],c[5]}, static_cast<uint16_t>(llen)});
+        }
+      }else if(llen>0){
+        const string_view line(lptr,llen);
+        if(parse_event_views(line,fields)&&!fields[0].empty()){
+          if(llen>UINT16_MAX)throw runtime_error("event line exceeds 65535 bytes");
+          const uint64_t h=fast_hash_sv(fields[0]);
+          local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
+              lptr, h, {255,0,0,0,0,0}, static_cast<uint16_t>(llen)});
+        }
       }
       start=stop+static_cast<size_t>(!!lf);
     }
@@ -524,20 +542,33 @@ int main(int argc,char**argv){
       }
       slots.swap(next);
     }
+    static inline void row_id_and_ingest(const CompactRow &r, string_view &id, string_view &ing){
+      if(r.c[0]!=255){
+        id=string_view(r.line_ptr,r.c[0]);
+        ing=string_view(r.line_ptr+r.c[2]+1,r.c[3]-r.c[2]-1);
+      }else{
+        array<string_view,7> tmp;
+        if(!parse_event_views(string_view(r.line_ptr,r.line_len),tmp))
+          throw runtime_error("internal CSV invariant");
+        id=tmp[0];
+        ing=tmp[3];
+      }
+    }
     void upsert(const CompactRow &c){
       if((winners.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
       const size_t mask=slots.size()-1;
       size_t pos=(c.hash_code>>6)&mask;
-      const string_view cid(c.line_ptr+c.id_off,c.id_len);
+      string_view cid, cand_ing;
+      row_id_and_ingest(c, cid, cand_ing);
       while(uint32_t s=slots[pos]){
         CompactRow &w=winners[s-1];
-        if(w.hash_code==c.hash_code &&
-           w.id_len==c.id_len &&
-           memcmp(w.line_ptr+w.id_off,cid.data(),c.id_len)==0){
-          const string_view prev_ing(w.line_ptr+w.ing_off,w.ing_len);
-          const string_view cand_ing(c.line_ptr+c.ing_off,c.ing_len);
-          if(cand_ing<prev_ing)w=c;
-          return;
+        if(w.hash_code==c.hash_code){
+          string_view wid, prev_ing;
+          row_id_and_ingest(w, wid, prev_ing);
+          if(wid==cid){
+            if(cand_ing<prev_ing)w=c;
+            return;
+          }
         }
         pos=(pos+1)&mask;
       }
@@ -560,13 +591,24 @@ int main(int argc,char**argv){
     out.reserve(tbl.winners.size());
     array<string_view,7> columns;
     for(const CompactRow &r:tbl.winners){
-      const string_view line(r.line_ptr,r.line_len);
-      if(!parse_event_views(line,columns))throw runtime_error("internal CSV invariant");
-      const string_view user=columns[1], tsstr=columns[2],
-                        event_type=columns[4], product=columns[5], price=columns[6];
+      string_view user, tsstr, ingeststr, event_type, product, price;
+      if(r.c[0]!=255){
+        const char *p=r.line_ptr;
+        user=string_view(p+r.c[0]+1, r.c[1]-r.c[0]-1);
+        tsstr=string_view(p+r.c[1]+1, r.c[2]-r.c[1]-1);
+        ingeststr=string_view(p+r.c[2]+1, r.c[3]-r.c[2]-1);
+        event_type=string_view(p+r.c[3]+1, r.c[4]-r.c[3]-1);
+        product=string_view(p+r.c[4]+1, r.c[5]-r.c[4]-1);
+        price=string_view(p+r.c[5]+1, r.line_len-r.c[5]-1);
+      }else{
+        if(!parse_event_views(string_view(r.line_ptr,r.line_len),columns))
+          throw runtime_error("internal CSV invariant");
+        user=columns[1]; tsstr=columns[2]; ingeststr=columns[3];
+        event_type=columns[4]; product=columns[5]; price=columns[6];
+      }
       if(user.empty()||product.empty()||(event_type!="view"&&event_type!="cart"&&event_type!="purchase"))continue;
       i64 ts,ingest;
-      if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(columns[3],ingest)||ingest-ts>DAY_MS)continue;
+      if(!parse_ts(tsstr,ts)||ts<lo||ts>=hi||!parse_ts(ingeststr,ingest)||ingest-ts>DAY_MS)continue;
       i64 cents=0;
       const bool purchase=event_type=="purchase";
       if(purchase){
