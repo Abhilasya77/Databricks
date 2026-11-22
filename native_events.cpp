@@ -326,21 +326,33 @@ int main(int argc,char**argv){
   //    open-addressed table (preserving exact smallest lexicographic ingest_ts),
   //    and immediately validates winners into parsed[part].
   constexpr size_t SHARD_COUNT=64;
-  // V60: Single-pass hot-cache parse + dedup record.
-  // Parses ts/ingest/price/type/user/product once in Phase 1 while CSV bytes are
-  // L1-hot, carrying `flags` (bit 0 = valid, bit 1 = purchase) through dedup so
-  // an invalid earlier-ingest duplicate still beats a valid later duplicate.
+  // V61: 32-byte packed single-pass hot-cache parse + dedup record.
+  // Retains V60 single-pass parsing while cutting CompactRow from 48B to 32B:
+  // - cents_flags: bits 0..23 = cents (<=10,000,000), bit 24 = valid,
+  //                bit 25 = purchase, bit 26 = is_long (line > 255 bytes).
+  // - hash32: upper hash bits (h >> 6) for per-partition LocalDedupTable.
+  // - offs[8]: uint8_t (id/ing/user/prod off+len) for lines <= 255B;
+  //            union long_len for rare lines > 255B.
+  static constexpr uint32_t ROW_VALID    = 1U << 24;
+  static constexpr uint32_t ROW_PURCHASE = 1U << 25;
+  static constexpr uint32_t ROW_LONG     = 1U << 26;
+  static constexpr uint32_t ROW_CENTS_MASK = (1U << 24) - 1U;
   struct CompactRow {
     const char *line_ptr;
-    uint64_t hash_code;
     i64 ts;
-    uint32_t cents;
-    uint16_t id_off, id_len;
-    uint16_t ing_off, ing_len;
-    uint16_t user_off, user_len;
-    uint16_t prod_off, prod_len;
-    uint8_t flags; // bit 0: valid, bit 1: purchase
+    uint32_t hash32;
+    uint32_t cents_flags;
+    union {
+      struct {
+        uint8_t id_off, id_len;
+        uint8_t ing_off, ing_len;
+        uint8_t user_off, user_len;
+        uint8_t prod_off, prod_len;
+      } s;
+      uint32_t long_len;
+    } u;
   };
+  static_assert(sizeof(CompactRow) == 32);
   size_t thread_count=min<size_t>(8,thread::hardware_concurrency()?thread::hardware_concurrency():4);
   if(const char* cpus=getenv("NCPU")){
     char *stop=nullptr;
@@ -387,22 +399,17 @@ int main(int argc,char**argv){
       if(parse_event_views(line,fields)&&!fields[0].empty()){
         const uint64_t h=fast_hash_sv(fields[0]);
         const char *lp=line.data();
-        const uint16_t id_off=static_cast<uint16_t>(fields[0].data()-lp);
-        const uint16_t id_len=static_cast<uint16_t>(fields[0].size());
-        const uint16_t ing_off=static_cast<uint16_t>(fields[3].data()-lp);
-        const uint16_t ing_len=static_cast<uint16_t>(fields[3].size());
         const string_view user=fields[1], tsstr=fields[2],
                           event_type=fields[4], product=fields[5], price=fields[6];
-        uint8_t flags=0;
+        uint32_t cf=0;
         i64 ts=0, ingest=0;
-        uint32_t cents=0;
-        uint16_t user_off=0, user_len=0, prod_off=0, prod_len=0;
         if(!user.empty()&&!product.empty()&&
            (event_type=="view"||event_type=="cart"||event_type=="purchase")&&
            parse_ts(tsstr,ts)&&ts>=lo&&ts<hi&&
            parse_ts(fields[3],ingest)&&ingest-ts<=DAY_MS){
           const bool purchase=(event_type=="purchase");
           bool ok=true;
+          uint32_t cents=0;
           if(purchase){
             if(price.empty()){ok=false;}
             else{
@@ -418,17 +425,30 @@ int main(int argc,char**argv){
             }
           }
           if(ok){
-            flags=static_cast<uint8_t>(1U | (purchase?2U:0U));
-            user_off=static_cast<uint16_t>(user.data()-lp);
-            user_len=static_cast<uint16_t>(user.size());
-            prod_off=static_cast<uint16_t>(product.data()-lp);
-            prod_len=static_cast<uint16_t>(product.size());
+            cf=cents | ROW_VALID | (purchase?ROW_PURCHASE:0U);
           }
         }
-        local_parts[h&(SHARD_COUNT-1)].push_back(CompactRow{
-            lp, h, ts, cents,
-            id_off, id_len, ing_off, ing_len,
-            user_off, user_len, prod_off, prod_len, flags});
+        CompactRow row{};
+        row.line_ptr=lp;
+        row.ts=ts;
+        row.hash32=static_cast<uint32_t>(h>>6);
+        if(line.size()<=255){
+          row.cents_flags=cf;
+          row.u.s.id_off=static_cast<uint8_t>(fields[0].data()-lp);
+          row.u.s.id_len=static_cast<uint8_t>(fields[0].size());
+          row.u.s.ing_off=static_cast<uint8_t>(fields[3].data()-lp);
+          row.u.s.ing_len=static_cast<uint8_t>(fields[3].size());
+          if(cf&ROW_VALID){
+            row.u.s.user_off=static_cast<uint8_t>(user.data()-lp);
+            row.u.s.user_len=static_cast<uint8_t>(user.size());
+            row.u.s.prod_off=static_cast<uint8_t>(product.data()-lp);
+            row.u.s.prod_len=static_cast<uint8_t>(product.size());
+          }
+        }else{
+          row.cents_flags=cf | ROW_LONG;
+          row.u.long_len=static_cast<uint32_t>(line.size());
+        }
+        local_parts[h&(SHARD_COUNT-1)].push_back(row);
       }
       start=stop+static_cast<size_t>(!!lf);
     }
@@ -558,11 +578,23 @@ int main(int argc,char**argv){
       while(cap<expected*2)cap*=2;
       slots.assign(cap,0);
     }
+    static inline void row_id_and_ingest(const CompactRow &r, string_view &id, string_view &ing){
+      if(!(r.cents_flags&ROW_LONG)){
+        id=string_view(r.line_ptr+r.u.s.id_off, r.u.s.id_len);
+        ing=string_view(r.line_ptr+r.u.s.ing_off, r.u.s.ing_len);
+      }else{
+        array<string_view,7> tmp;
+        if(!parse_event_views(string_view(r.line_ptr,r.u.long_len),tmp))
+          throw runtime_error("internal CSV invariant");
+        id=tmp[0];
+        ing=tmp[3];
+      }
+    }
     void rehash(size_t cap){
       vector<uint32_t> next(cap,0);
       const size_t mask=cap-1;
       for(size_t i=0;i<winners.size();++i){
-        size_t pos=(winners[i].hash_code>>6)&mask;
+        size_t pos=winners[i].hash32&mask;
         while(next[pos])pos=(pos+1)&mask;
         next[pos]=static_cast<uint32_t>(i+1);
       }
@@ -571,17 +603,18 @@ int main(int argc,char**argv){
     void upsert(const CompactRow &c){
       if((winners.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
       const size_t mask=slots.size()-1;
-      size_t pos=(c.hash_code>>6)&mask;
-      const string_view cid(c.line_ptr+c.id_off,c.id_len);
+      size_t pos=c.hash32&mask;
+      string_view cid, cand_ing;
+      row_id_and_ingest(c, cid, cand_ing);
       while(uint32_t s=slots[pos]){
         CompactRow &w=winners[s-1];
-        if(w.hash_code==c.hash_code &&
-           w.id_len==c.id_len &&
-           memcmp(w.line_ptr+w.id_off,cid.data(),c.id_len)==0){
-          const string_view prev_ing(w.line_ptr+w.ing_off,w.ing_len);
-          const string_view cand_ing(c.line_ptr+c.ing_off,c.ing_len);
-          if(cand_ing<prev_ing)w=c;
-          return;
+        if(w.hash32==c.hash32){
+          string_view wid, prev_ing;
+          row_id_and_ingest(w, wid, prev_ing);
+          if(wid==cid){
+            if(cand_ing<prev_ing)w=c;
+            return;
+          }
         }
         pos=(pos+1)&mask;
       }
@@ -602,13 +635,22 @@ int main(int argc,char**argv){
     }
     auto &out=parsed[slot];
     out.reserve(tbl.winners.size());
+    array<string_view,7> tmp;
     for(const CompactRow &r:tbl.winners){
-      if(!(r.flags&1U))continue;
-      out.push_back(ParsedEvent{
-          r.ts, static_cast<i64>(r.cents),
-          string_view(r.line_ptr+r.user_off, r.user_len),
-          string_view(r.line_ptr+r.prod_off, r.prod_len),
-          (r.flags&2U)!=0});
+      if(!(r.cents_flags&ROW_VALID))continue;
+      const i64 cents=static_cast<i64>(r.cents_flags&ROW_CENTS_MASK);
+      const bool purchase=(r.cents_flags&ROW_PURCHASE)!=0;
+      if(!(r.cents_flags&ROW_LONG)){
+        out.push_back(ParsedEvent{
+            r.ts, cents,
+            string_view(r.line_ptr+r.u.s.user_off, r.u.s.user_len),
+            string_view(r.line_ptr+r.u.s.prod_off, r.u.s.prod_len),
+            purchase});
+      }else{
+        if(!parse_event_views(string_view(r.line_ptr,r.u.long_len),tmp))
+          throw runtime_error("internal CSV invariant");
+        out.push_back(ParsedEvent{r.ts, cents, tmp[1], tmp[5], purchase});
+      }
     }
   };
   size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
