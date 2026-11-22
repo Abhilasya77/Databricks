@@ -550,15 +550,17 @@ int main(int argc,char**argv){
     }
   };
 
-  // V64: Partition-local interning + sessionization in direct_parquet mode.
+  // V66-1: Isolated 32-byte packed PersonEvent on V64 baseline.
   constexpr size_t PERSON_PARTS=64;
+  static constexpr uint32_t PE_PURCHASE_BIT = 1U << 31;
+  static constexpr uint32_t PE_CAT_MASK     = PE_PURCHASE_BIT - 1U;
   struct PersonEvent {
     i64 ts;
-    i64 cents;
     string_view person;
-    uint32_t category;
-    bool purchase;
+    uint32_t cents;
+    uint32_t cat_flags;
   };
+  static_assert(sizeof(PersonEvent) == 32);
   const size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
   vector<vector<vector<PersonEvent>>> person_buckets;
   if(direct_parquet){
@@ -608,7 +610,7 @@ int main(int argc,char**argv){
           cat_id=(cit==product_cat_id.end())?unknown_cat_id:cit->second;
         }
         const size_t ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
-        person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,cents,person,cat_id,purchase});
+        person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,person,static_cast<uint32_t>(cents),cat_id|(purchase?PE_PURCHASE_BIT:0U)});
       }else{
         out_parsed->push_back(ParsedEvent{ts,cents,user,product,purchase});
       }
@@ -687,7 +689,7 @@ int main(int argc,char**argv){
             for(const PersonEvent &pe:b){
               auto [it,ins]=local_pids.try_emplace(pe.person,static_cast<uint32_t>(local_people.size()));
               if(ins)local_people.push_back(pe.person);
-              local_events.push_back(Event{pe.ts,pe.cents,it->second,pe.category,pe.purchase});
+              local_events.push_back(Event{pe.ts,static_cast<i64>(pe.cents),it->second,pe.cat_flags&PE_CAT_MASK,(pe.cat_flags&PE_PURCHASE_BIT)!=0});
             }
             vector<PersonEvent>().swap(b);
           }
