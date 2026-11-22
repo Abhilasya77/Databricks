@@ -104,17 +104,57 @@ static bool parse_line(const string &line,size_t fields,vector<string> &out){
   }
   return out.size()==fields;
 }
+// Fast 64-bit hash for event IDs (inlined, 8-byte chunked + avalanche).
+static inline uint64_t fast_hash_sv(string_view s) noexcept {
+  const char *p = s.data();
+  size_t n = s.size();
+  uint64_t h = 0x9e3779b97f4a7c15ULL ^ (static_cast<uint64_t>(n) * 0xbf58476d1ce4e5b9ULL);
+  while (n >= 8) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    h ^= v;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    p += 8;
+    n -= 8;
+  }
+  uint64_t tail = 0;
+  if (n > 0) memcpy(&tail, p, n);
+  h ^= tail;
+  h ^= h >> 30;
+  h *= 0xbf58476d1ce4e5b9ULL;
+  h ^= h >> 27;
+  h *= 0x94d049bb133111ebULL;
+  h ^= h >> 31;
+  return h;
+}
+
 // Zero-allocation parser for event rows. Views remain valid while `line` lives.
 // The challenge dialect has no escaped quotes and no quoted commas.
 static bool parse_event_views(string_view line, array<string_view,7> &out){
   if(line.empty())return false;
+  const char *base=line.data();
+  const size_t len=line.size();
+  if(!memchr(base,'"',len)){
+    size_t begin=0;
+    for(size_t i=0;i<6;++i){
+      const void *comma=memchr(base+begin,',',len-begin);
+      if(!comma)return false;
+      const size_t end=static_cast<const char*>(comma)-base;
+      out[i]=string_view(base+begin,end-begin);
+      begin=end+1;
+    }
+    if(memchr(base+begin,',',len-begin))return false;
+    out[6]=string_view(base+begin,len-begin);
+    return true;
+  }
   size_t begin=0;
   for(size_t i=0;i<7;++i){
     size_t end=line.find(',',begin);
     if(i<6 && end==string::npos)return false;
     if(i==6 && end!=string::npos)return false;
-    if(end==string::npos)end=line.size();
-    string_view value(line.data()+begin,end-begin);
+    if(end==string::npos)end=len;
+    string_view value(base+begin,end-begin);
     if(value.find('"')!=string_view::npos){
       if(value.size()<2||value.front()!='"'||value.back()!='"'||
          value.find('"',1)!=value.size()-1)return false;
@@ -361,7 +401,7 @@ int main(int argc,char**argv){
       if(parse_event_views(line,fields)&&!fields[0].empty()){
         const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
         const uint32_t il=static_cast<uint32_t>(fields[3].size());
-        const size_t idhash=hash<string_view>{}(fields[0]);
+        const size_t idhash=static_cast<size_t>(fast_hash_sv(fields[0]));
         staged[idhash&(SHARD_COUNT-1)].push_back(Candidate{fields[0],Raw{line,ip,il},idhash});
       }
       start=stop+static_cast<size_t>(!!lf);
