@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "native_campaign.hpp"
+#include "native_parquet.hpp"
 using namespace std;
 namespace fs = std::filesystem;
 using i64 = int64_t;
@@ -200,7 +201,12 @@ int main(int argc,char**argv){
     }
     last_profile=now;
   };
-  if(argc!=5 && argc!=6){cerr<<"usage: native_events DATA_DIR ID_MAP_BIN USERS_JSONL SESSIONS_JSONL [CAMPAIGN_JSONL]\n";return 2;}
+  if(argc!=5 && argc!=6 && argc!=7){cerr<<"usage: native_events DATA_DIR ID_MAP_BIN USERS_JSONL SESSIONS_JSONL [CAMPAIGN_JSONL]\n";return 2;}
+  const bool direct_parquet = argc==7;
+  if(direct_parquet){
+    fs::create_directories(fs::path(argv[6])/"user_daily");
+    fs::create_directories(fs::path(argv[6])/"campaign_daily");
+  }
   fs::path data=argv[1];unordered_map<string,string> ids;
   read_map(argv[2],ids);
   ifstream mi(data/"manifest.json",ios::binary);
@@ -582,7 +588,7 @@ int main(int argc,char**argv){
   // V34: each worker owns whole canonical-person ranges. All output stays
   // ordered by lexicographic person via deterministic ordered concatenation.
   // Legacy argc==5 output retains its global session numbering unchanged.
-  if(argc==6 && thread_count>1 && sorted_people.size()>1000){
+  if(argc>=6 && thread_count>1 && sorted_people.size()>1000){
     struct Block {
       string users_json;
       vector<native_campaign::CampaignSession> sessions;
@@ -604,6 +610,9 @@ int main(int argc,char**argv){
     auto process_block=[&](size_t bi){
       Block &out=blocks[bi];
       ostringstream users;
+      unique_ptr<native_parquet::UserDailyParquetWriter> parquet;
+      if(direct_parquet)parquet=make_unique<native_parquet::UserDailyParquetWriter>(
+        (fs::path(argv[6])/"user_daily"/("part-"+to_string(bi)+".parquet")).string());
       Session cur;
       Daily daily;
       bool have_session=false,have_daily=false;
@@ -616,10 +625,15 @@ int main(int argc,char**argv){
           if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
             best=kv.first;bestsum=kv.second;has=true;
           }
-        users<<"{\"user_id\":"<<json_escape(daily.person)<<",\"day\":"<<json_escape(daily.day)
-          <<",\"sessions\":"<<daily.sessions<<",\"events\":"<<daily.events
-          <<",\"revenue_cents\":"<<daily.revenue<<",\"top_category\":"
-          <<(has?json_escape(best):"null")<<"}\n";
+        if(direct_parquet){
+          parquet->write_row(daily.person,native_parquet::parse_date_days(daily.day),
+            daily.sessions,daily.events,daily.revenue,best,!has);
+        }else{
+          users<<"{\"user_id\":"<<json_escape(daily.person)<<",\"day\":"<<json_escape(daily.day)
+            <<",\"sessions\":"<<daily.sessions<<",\"events\":"<<daily.events
+            <<",\"revenue_cents\":"<<daily.revenue<<",\"top_category\":"
+            <<(has?json_escape(best):"null")<<"}\n";
+        }
         ++out.daily_count;
       };
       auto flush_session=[&](){
@@ -651,6 +665,7 @@ int main(int argc,char**argv){
         prev=e.ts;last_person=e.person;
       }
       flush_session();flush_daily();
+      if(parquet)parquet->finish();
       out.users_json=users.str();
     };
     auto worker=[&](){
@@ -686,7 +701,10 @@ int main(int argc,char**argv){
   // millions of session objects. Input is ordered by canonical person + time,
   // so days are monotone within a person.
   Session cur;
-  if(argc==6) campaign_sessions.reserve(events.size()/5);
+  unique_ptr<native_parquet::UserDailyParquetWriter> parquet;
+  if(direct_parquet)parquet=make_unique<native_parquet::UserDailyParquetWriter>(
+    (fs::path(argv[6])/"user_daily"/"part-0.parquet").string());
+  if(argc>=6) campaign_sessions.reserve(events.size()/5);
   Daily daily;
   bool have_session=false, have_daily=false;
   i64 prev=0;
@@ -698,10 +716,15 @@ int main(int argc,char**argv){
       if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
         best=kv.first;bestsum=kv.second;has=true;
       }
-    uo<<"{\"user_id\":"<<json_escape(daily.person)<<",\"day\":"<<json_escape(daily.day)
-      <<",\"sessions\":"<<daily.sessions<<",\"events\":"<<daily.events
-      <<",\"revenue_cents\":"<<daily.revenue<<",\"top_category\":"
-      <<(has?json_escape(best):"null")<<"}\n";
+    if(direct_parquet){
+      parquet->write_row(daily.person,native_parquet::parse_date_days(daily.day),
+        daily.sessions,daily.events,daily.revenue,best,!has);
+    }else{
+      uo<<"{\"user_id\":"<<json_escape(daily.person)<<",\"day\":"<<json_escape(daily.day)
+        <<",\"sessions\":"<<daily.sessions<<",\"events\":"<<daily.events
+        <<",\"revenue_cents\":"<<daily.revenue<<",\"top_category\":"
+        <<(has?json_escape(best):"null")<<"}\n";
+    }
     ++daily_count;
   };
   auto flush_session=[&](){
@@ -717,7 +740,7 @@ int main(int argc,char**argv){
         <<",\"has_purchase\":"<<(cur.purchased?"true":"false")<<"}\n";
     }
     ++session_count;
-    if(argc==6) campaign_sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
+    if(argc>=6) campaign_sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
     if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
       flush_daily();
       daily=Daily{cur.person,cur.day};
@@ -740,23 +763,33 @@ int main(int argc,char**argv){
     prev=e.ts;last_person=e.person;
   }
   flush_session();flush_daily();
+  if(parquet)parquet->finish();
 
   }
   so.close();uo.close();
   profile("sessionize_and_json_output");
-  if(argc==6){
+  if(argc>=6){
     auto rows=native_campaign::compute_campaign_daily_native(data.string(),ids,lo,hi,campaign_sessions);
-    ofstream co(argv[5],ios::binary);
-    if(!co)throw runtime_error("campaign output not writable");
-    for(const auto &r:rows)
-      co<<"{\"campaign_id\":"<<json_escape(r.campaign_id)
-        <<",\"channel\":"<<json_escape(r.channel)
-        <<",\"day\":"<<json_escape(r.day)
-        <<",\"sessions\":"<<r.sessions
-        <<",\"purchasing_sessions\":"<<r.purchasing_sessions
-        <<",\"revenue_cents\":"<<r.revenue_cents
-        <<",\"assisted_sessions\":"<<r.assisted_sessions<<"}\n";
-    co.close();
+    if(direct_parquet){
+      native_parquet::CampaignDailyParquetWriter cw(
+        (fs::path(argv[6])/"campaign_daily"/"part-0.parquet").string());
+      for(const auto &r:rows)cw.write_row(r.campaign_id,r.channel,
+        native_parquet::parse_date_days(r.day),r.sessions,r.purchasing_sessions,
+        r.revenue_cents,r.assisted_sessions);
+      cw.finish();
+    }else{
+      ofstream co(argv[5],ios::binary);
+      if(!co)throw runtime_error("campaign output not writable");
+      for(const auto &r:rows)
+        co<<"{\"campaign_id\":"<<json_escape(r.campaign_id)
+          <<",\"channel\":"<<json_escape(r.channel)
+          <<",\"day\":"<<json_escape(r.day)
+          <<",\"sessions\":"<<r.sessions
+          <<",\"purchasing_sessions\":"<<r.purchasing_sessions
+          <<",\"revenue_cents\":"<<r.revenue_cents
+          <<",\"assisted_sessions\":"<<r.assisted_sessions<<"}\n";
+      co.close();
+    }
     profile("campaign_native");
   }
   cerr<<"native_events: clean="<<events.size()<<" sessions="<<session_count<<" user_days="<<daily_count<<"\n";

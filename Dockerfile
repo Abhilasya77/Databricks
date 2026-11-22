@@ -2,8 +2,8 @@
 # Separate build stage keeps the runtime image small and does not require a
 # compiler when the scorer runs the read-only container.
 FROM gcc:12-bookworm AS native_builder
-COPY native_events.cpp native_campaign.cpp native_campaign.hpp /src/
-RUN g++ -std=c++17 -O3 -DNDEBUG -pthread -s /src/native_events.cpp /src/native_campaign.cpp -o /native_events
+COPY native_events.cpp native_campaign.cpp native_campaign.hpp native_parquet.cpp native_parquet.hpp /src/
+RUN g++ -std=c++17 -O3 -DNDEBUG -pthread -s /src/native_events.cpp /src/native_campaign.cpp /src/native_parquet.cpp -o /native_events
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \

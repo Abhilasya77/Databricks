@@ -159,8 +159,6 @@ public:
     ParquetFileCore(const std::string& path, std::vector<ColSpec> schema)
         : out_(path, std::ios::binary | std::ios::trunc), schema_(std::move(schema)) {
         if (!out_) throw std::runtime_error("Failed to open Parquet output: " + path);
-        static char io_buf[1 << 20];
-        out_.rdbuf()->pubsetbuf(io_buf, sizeof(io_buf));
         write_bytes("PAR1", 4);
     }
 

@@ -1,4 +1,4 @@
-﻿"""Optional C++ event-processing backend for the Shopping Sessions pipeline.
+"""Optional C++ event-processing backend for the Shopping Sessions pipeline.
 
 Companion to ../native_events.cpp. The interface returns the same Session and
 user_daily types as events_sessions.compute_events_sessions(), so our campaign
@@ -88,13 +88,24 @@ def native_event_files(data_dir, identity_map, scratch_dir=None):
         sessions_path = folder / 'sessions.jsonl'
         campaigns_path = folder / 'campaigns.jsonl'
         mapped = time.perf_counter()
-        subprocess.run([str(binary), str(data_dir), str(ids),
-                        str(users_path), str(sessions_path), str(campaigns_path)], check=True)
+        command = [str(binary), str(data_dir), str(ids),
+                   str(users_path), str(sessions_path), str(campaigns_path)]
+        if os.environ.get('SHOPPING_DIRECT_PARQUET') == '1':
+            command.append(os.environ.get('OUTPUT_DIR', '/output'))
+        subprocess.run(command, check=True)
         native_done = time.perf_counter()
         if os.environ.get('SHOPPING_PROFILE') == '1':
             print(f'PROFILE bridge_idmap_seconds={mapped-start:.3f}', file=sys.stderr)
             print(f'PROFILE native_engine_seconds={native_done-mapped:.3f}', file=sys.stderr)
-            print(f'PROFILE bridge_sessions_bytes={sessions_path.stat().st_size}', file=sys.stderr)
-            print(f'PROFILE bridge_users_bytes={users_path.stat().st_size}', file=sys.stderr)
-            print(f'PROFILE bridge_campaigns_bytes={campaigns_path.stat().st_size}', file=sys.stderr)
+            # Direct-Parquet mode writes tables straight to OUTPUT_DIR, so
+            # intermediate JSONL files may be absent by design.
+            if os.environ.get('SHOPPING_DIRECT_PARQUET') == '1':
+                out = Path(os.environ.get('OUTPUT_DIR', '/output'))
+                for table in ('user_daily', 'campaign_daily'):
+                    files = list((out / table).glob('*.parquet'))
+                    print(f'PROFILE bridge_{table}_parquet_bytes={sum(p.stat().st_size for p in files)}', file=sys.stderr)
+            else:
+                print(f'PROFILE bridge_sessions_bytes={sessions_path.stat().st_size}', file=sys.stderr)
+                print(f'PROFILE bridge_users_bytes={users_path.stat().st_size}', file=sys.stderr)
+                print(f'PROFILE bridge_campaigns_bytes={campaigns_path.stat().st_size}', file=sys.stderr)
         yield sessions_path, users_path, campaigns_path

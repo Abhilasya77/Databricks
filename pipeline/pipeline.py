@@ -15,7 +15,6 @@ import shutil
 import sys
 import time
 
-import duckdb
 from first_submission import compute_both, compute_native_jsonl_paths
 
 DATA = Path(os.environ.get('DATA_DIR', '/data'))
@@ -129,6 +128,20 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     do_profile = os.environ.get('SHOPPING_PROFILE') == '1'
 
+    # V41: direct C++ Parquet mode. Retain native identity-link preparation,
+    # but bypass DuckDB and JSONL materialization entirely.
+    if (os.environ.get('SHOPPING_NATIVE_EVENTS', '1') == '1'
+            and os.environ.get('SHOPPING_DIRECT_PARQUET', '0') == '1'):
+        _prepare_out_dir(OUT / 'user_daily')
+        _prepare_out_dir(OUT / 'campaign_daily')
+        started = time.perf_counter()
+        with compute_native_jsonl_paths(DATA):
+            pass
+        print(f'Native direct Parquet: total={time.perf_counter()-started:.3f}s',
+              file=sys.stderr)
+        return
+
+    import duckdb  # avoid expensive import in native direct-Parquet mode
     con = duckdb.connect()
     con.execute(f'SET threads = {NCPU}')
     con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.8))}GB'")
