@@ -482,21 +482,39 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
     std::vector<std::string> idx_to_day;
     idx_to_day.reserve(64);
 
-    std::vector<SessionRef> raw_srefs;
-    raw_srefs.reserve(sessions.size());
+    // Pre-allocate raw_srefs and per-person counts to avoid mid-loop vector growth
+    const size_t n_sess = sessions.size();
+    std::vector<SessionRef> raw_srefs(n_sess);
     std::vector<uint32_t> person_sess_counts;
-    person_sess_counts.reserve(sessions.size() / 2 + 16);
+    person_sess_counts.reserve(n_sess / 2 + 16);
+
+    std::string_view last_person;
+    uint32_t last_pidx = 0;
+    bool has_last_person = false;
 
     std::string_view last_day;
     uint32_t last_didx = 0;
     bool has_last_day = false;
 
-    for (const auto& s : sessions) {
-        bool ins_p = false;
-        const uint32_t pidx = person_to_idx.get_or_insert(
-            s.person_id, static_cast<uint32_t>(person_sess_counts.size()), ins_p);
-        if (ins_p) person_sess_counts.push_back(1);
-        else person_sess_counts[pidx] += 1;
+    for (size_t i = 0; i < n_sess; ++i) {
+        const auto& s = sessions[i];
+        uint32_t pidx = 0;
+        if (has_last_person && s.person_id == last_person) {
+            pidx = last_pidx;
+            person_sess_counts[pidx] += 1;
+        } else {
+            bool ins_p = false;
+            pidx = person_to_idx.get_or_insert(
+                s.person_id, static_cast<uint32_t>(person_sess_counts.size()), ins_p);
+            if (ins_p) {
+                person_sess_counts.push_back(1);
+            } else {
+                person_sess_counts[pidx] += 1;
+            }
+            last_person = s.person_id;
+            last_pidx = pidx;
+            has_last_person = true;
+        }
 
         uint32_t didx = 0;
         if (has_last_day && s.day == last_day) {
@@ -511,23 +529,31 @@ std::vector<CampaignDailyRow> compute_campaign_daily_native(
             has_last_day = true;
         }
 
-        raw_srefs.push_back(SessionRef{pidx, didx, s.session_start_ms, s.revenue_cents, s.has_purchase});
+        raw_srefs[i] = SessionRef{pidx, didx, s.session_start_ms, s.revenue_cents, s.has_purchase};
     }
 
     const uint32_t num_persons = static_cast<uint32_t>(person_sess_counts.size());
 
-    std::vector<uint32_t> person_sess_offsets(num_persons + 1, 0);
+    // Build prefix offsets in-place in person_sess_counts (size num_persons + 1)
+    person_sess_counts.push_back(0);
+    uint32_t running_off = 0;
     for (uint32_t p = 0; p < num_persons; ++p) {
-        person_sess_offsets[p + 1] = person_sess_offsets[p] + person_sess_counts[p];
+        const uint32_t cnt = person_sess_counts[p];
+        person_sess_counts[p] = running_off;
+        running_off += cnt;
     }
+    person_sess_counts[num_persons] = running_off;
+    const auto& person_sess_offsets = person_sess_counts;
 
-    std::vector<SessionRef> srefs(raw_srefs.size());
-    std::vector<uint32_t> write_pos = person_sess_offsets;
+    std::vector<SessionRef> srefs(n_sess);
+    std::vector<uint32_t> write_pos(person_sess_offsets.begin(), person_sess_offsets.begin() + num_persons);
     for (const auto& sr : raw_srefs) {
         srefs[write_pos[sr.person_idx]++] = sr;
     }
     raw_srefs.clear();
     std::vector<SessionRef>().swap(raw_srefs);
+    write_pos.clear();
+    std::vector<uint32_t>().swap(write_pos);
 
     const size_t sort_workers = (num_persons >= 4096) ? get_worker_count(8) : 1;
     if (sort_workers <= 1) {
@@ -904,7 +930,7 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--bench") {
         const size_t n_sess = std::stoull(argv[2]);
         const size_t n_clicks = std::stoull(argv[3]);
-        const fs::path tmp = fs::temp_directory_path() / "campaign_bench_v43";
+        const fs::path tmp = fs::temp_directory_path() / "campaign_bench_v48";
         fs::create_directories(tmp / "clicks");
 
         {
