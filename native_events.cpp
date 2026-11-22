@@ -494,6 +494,10 @@ int main(int argc,char**argv){
     if(inserted)category_names.push_back(name);
     return it->second;
   };
+  const uint32_t unknown_cat_id=category_number("unknown");
+  unordered_map<string_view,uint32_t> product_cat_id;
+  product_cat_id.reserve(product_lookup.size()*2+16);
+  for(const auto &kv:product_lookup)product_cat_id.emplace(kv.first,category_number(string(kv.second)));
   // V22: parse and validate each disjoint dedup shard in parallel.
   // Borrow string_views from Raw rows until after all users/categories are
   // interned. Consume shard results in baseline order for deterministic output.
@@ -546,7 +550,22 @@ int main(int argc,char**argv){
     }
   };
 
-  auto validate_shard=[&](size_t slot, LocalDedupTable &tbl){
+  // V64: Partition-local interning + sessionization in direct_parquet mode.
+  constexpr size_t PERSON_PARTS=64;
+  struct PersonEvent {
+    i64 ts;
+    i64 cents;
+    string_view person;
+    uint32_t category;
+    bool purchase;
+  };
+  const size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
+  vector<vector<vector<PersonEvent>>> person_buckets;
+  if(direct_parquet){
+    person_buckets.resize(validation_threads);
+    for(auto &vb:person_buckets)vb.resize(PERSON_PARTS);
+  }
+  auto validate_shard=[&](size_t slot, LocalDedupTable &tbl, size_t worker_tid){
     size_t total_in=0;
     for(size_t tid=0;tid<thread_count;++tid)total_in+=worker_buckets[tid][slot].size();
     if(total_in==0)return;
@@ -556,8 +575,8 @@ int main(int argc,char**argv){
       for(const CompactRow &c:b)tbl.upsert(c);
       vector<CompactRow>().swap(b); // free partition input immediately
     }
-    auto &out=parsed[slot];
-    out.reserve(tbl.winners.size());
+    auto *out_parsed=direct_parquet?nullptr:&parsed[slot];
+    if(out_parsed)out_parsed->reserve(tbl.winners.size());
     array<string_view,7> columns;
     for(const CompactRow &r:tbl.winners){
       const string_view line(r.line_ptr,r.line_len);
@@ -580,24 +599,35 @@ int main(int argc,char**argv){
         }
         if(!valid_price||cents<1)continue;
       }
-      out.push_back(ParsedEvent{ts,cents,user,product,purchase});
+      if(direct_parquet){
+        auto id=identity_lookup.find(user);
+        const string_view person=(id==identity_lookup.end())?user:id->second;
+        uint32_t cat_id=0;
+        if(purchase){
+          auto cit=product_cat_id.find(product);
+          cat_id=(cit==product_cat_id.end())?unknown_cat_id:cit->second;
+        }
+        const size_t ppart=fast_hash_sv(person)&(PERSON_PARTS-1);
+        person_buckets[worker_tid][ppart].push_back(PersonEvent{ts,cents,person,cat_id,purchase});
+      }else{
+        out_parsed->push_back(ParsedEvent{ts,cents,user,product,purchase});
+      }
     }
   };
-  size_t validation_threads=min<size_t>(thread_count,SHARD_COUNT);
   if(validation_threads<=1){
     LocalDedupTable tbl;
-    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s,tbl);
+    for(size_t s=0;s<SHARD_COUNT;++s)validate_shard(s,tbl,0);
   }else{
     atomic<size_t> next_shard{0};
     exception_ptr failure;
     mutex failure_lock;
-    auto worker=[&](){
+    auto worker=[&](size_t tid){
       try{
         LocalDedupTable tbl;
         for(;;){
           auto slot=next_shard.fetch_add(1,memory_order_relaxed);
           if(slot>=SHARD_COUNT)break;
-          validate_shard(slot,tbl);
+          validate_shard(slot,tbl,tid);
         }
       }catch(...){
         lock_guard<mutex> g(failure_lock);
@@ -606,11 +636,142 @@ int main(int argc,char**argv){
     };
     vector<thread> workers;
     workers.reserve(validation_threads);
-    for(size_t i=0;i<validation_threads;++i)workers.emplace_back(worker);
+    for(size_t i=0;i<validation_threads;++i)workers.emplace_back(worker,i);
     for(auto &t:workers)t.join();
     if(failure)rethrow_exception(failure);
   }
   profile("event_parse_parallel");
+  ofstream so(argv[4],ios::binary);
+  ofstream uo(argv[3],ios::binary);
+  if(!so||!uo)throw runtime_error("output not writable");
+  vector<native_campaign::CampaignSession> campaign_sessions;
+  i64 session_count=0, daily_count=0;
+
+  if(direct_parquet){
+    worker_buckets.clear();
+    profile("event_validate");
+    profile("event_sort");
+    const size_t part_workers=min<size_t>(thread_count,PERSON_PARTS);
+    struct PartOut {
+      vector<native_campaign::CampaignSession> sessions;
+      i64 session_count=0, daily_count=0;
+    };
+    vector<PartOut> pouts(part_workers);
+    atomic<size_t> next_part{0};
+    exception_ptr perror;
+    mutex perror_lock;
+    auto run_part_worker=[&](size_t tid){
+      try{
+        PartOut &out=pouts[tid];
+        native_parquet::UserDailyParquetWriter parquet(
+          (fs::path(argv[6])/"user_daily"/("part-"+to_string(tid)+".parquet")).string());
+        unordered_map<string_view,uint32_t> local_pids;
+        vector<string_view> local_people;
+        vector<Event> local_events;
+        vector<Event> local_grouped;
+        vector<size_t> local_ends;
+        vector<size_t> local_write;
+        for(;;){
+          const size_t part=next_part.fetch_add(1,memory_order_relaxed);
+          if(part>=PERSON_PARTS)break;
+          size_t total_ev=0;
+          for(size_t w=0;w<validation_threads;++w)total_ev+=person_buckets[w][part].size();
+          if(total_ev==0)continue;
+          local_pids.clear();
+          local_people.clear();
+          local_events.clear();
+          local_events.reserve(total_ev);
+          local_pids.reserve(total_ev/4+64);
+          for(size_t w=0;w<validation_threads;++w){
+            auto &b=person_buckets[w][part];
+            for(const PersonEvent &pe:b){
+              auto [it,ins]=local_pids.try_emplace(pe.person,static_cast<uint32_t>(local_people.size()));
+              if(ins)local_people.push_back(pe.person);
+              local_events.push_back(Event{pe.ts,pe.cents,it->second,pe.category,pe.purchase});
+            }
+            vector<PersonEvent>().swap(b);
+          }
+          const size_t np=local_people.size();
+          local_ends.assign(np+1,0);
+          for(const Event &e:local_events)++local_ends[static_cast<size_t>(e.person)+1];
+          for(size_t i=1;i<=np;++i)local_ends[i]+=local_ends[i-1];
+          local_write=local_ends;
+          local_grouped.resize(local_events.size());
+          for(const Event &e:local_events)local_grouped[local_write[e.person]++]=e;
+
+          Session cur;
+          Daily daily;
+          bool have_session=false, have_daily=false;
+          i64 prev=0;
+          uint32_t last_person=UINT32_MAX;
+          auto flush_daily=[&](){
+            if(!have_daily)return;
+            string best;bool has=false;i64 bestsum=0;
+            for(const auto &kv:daily.categories)
+              if(!has||kv.second>bestsum||(kv.second==bestsum&&kv.first<best)){
+                best=kv.first;bestsum=kv.second;has=true;
+              }
+            parquet.write_row(daily.person,native_parquet::parse_date_days(daily.day),
+              daily.sessions,daily.events,daily.revenue,best,!has);
+            ++out.daily_count;
+          };
+          auto flush_session=[&](){
+            if(!have_session)return;
+            ++out.session_count;
+            out.sessions.push_back(native_campaign::CampaignSession{cur.person,cur.day,cur.start,cur.revenue,cur.purchased});
+            if(!have_daily||daily.person!=cur.person||daily.day!=cur.day){
+              flush_daily();
+              daily=Daily{cur.person,cur.day};
+              have_daily=true;
+            }
+            daily.sessions++;daily.events+=cur.events;daily.revenue+=cur.revenue;
+            for(const auto &c:cur.category_revenue)daily.categories[c.first]+=c.second;
+          };
+          for(size_t pid=0;pid<np;++pid){
+            const size_t from=local_ends[pid], to=local_ends[pid+1];
+            if(to-from>1)
+              sort(local_grouped.begin()+from,local_grouped.begin()+to,
+                   [](const Event&a,const Event&b){return a.ts<b.ts;});
+            const string person_str(local_people[pid]);
+            for(size_t k=from;k<to;++k){
+              const Event &e=local_grouped[k];
+              if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
+                flush_session();
+                cur=Session{person_str,day_string(e.ts),e.ts};
+                have_session=true;
+              }
+              ++cur.events;
+              if(e.purchase){
+                cur.purchased=true;cur.revenue+=e.cents;
+                cur.category_revenue[category_names[e.category]]+=e.cents;
+              }
+              prev=e.ts;last_person=e.person;
+            }
+          }
+          flush_session();flush_daily();
+        }
+        parquet.finish();
+      }catch(...){
+        lock_guard<mutex> g(perror_lock);
+        if(!perror)perror=current_exception();
+      }
+    };
+    vector<thread> workers;
+    workers.reserve(part_workers);
+    for(size_t i=0;i<part_workers;++i)workers.emplace_back(run_part_worker,i);
+    for(auto &t:workers)t.join();
+    if(perror)rethrow_exception(perror);
+    size_t total_cs=0;
+    for(const auto &o:pouts)total_cs+=o.sessions.size();
+    campaign_sessions.reserve(total_cs);
+    for(auto &o:pouts){
+      session_count+=o.session_count;
+      daily_count+=o.daily_count;
+      campaign_sessions.insert(campaign_sessions.end(),
+        make_move_iterator(o.sessions.begin()),make_move_iterator(o.sessions.end()));
+      o.sessions.clear();
+    }
+  }else{
   const auto intern_start=chrono::steady_clock::now();
   // Preserve the baseline's single-threaded person/category interning order.
   for(auto &bucket:parsed)for(const ParsedEvent &p:bucket){
@@ -717,11 +878,7 @@ int main(int argc,char**argv){
     }
   }
   profile("event_sort");
-  ofstream so(argv[4],ios::binary);
-  ofstream uo(argv[3],ios::binary);
-  if(!so||!uo)throw runtime_error("output not writable");
-  vector<native_campaign::CampaignSession> campaign_sessions;
-  i64 session_count=0, daily_count=0;
+
   // V34: each worker owns whole canonical-person ranges. All output stays
   // ordered by lexicographic person via deterministic ordered concatenation.
   // Legacy argc==5 output retains its global session numbering unchanged.
@@ -902,6 +1059,7 @@ int main(int argc,char**argv){
   flush_session();flush_daily();
   if(parquet)parquet->finish();
 
+  }
   }
   so.close();uo.close();
   profile("sessionize_and_json_output");
