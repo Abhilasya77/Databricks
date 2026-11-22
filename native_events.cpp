@@ -417,7 +417,9 @@ int main(int argc,char**argv){
   vector<Event> events;events.reserve(n_raw);
   // Intern the canonical person and purchase category once. Events now store
   // 32-byte POD records instead of two separately allocated strings.
-  unordered_map<string,uint32_t> person_ids;
+  // Borrow canonical names from stable identity-map values or event mmaps.
+  // All referenced storage outlives interning and person-id ranking.
+  unordered_map<string_view,uint32_t> person_ids;
   // Cache canonical numeric IDs by original raw user ID. The keys borrow
   // stable bytes from the read-only event mmaps, which outlive validation.
   // Repeated users bypass BOTH identity-map and person-interning lookups.
@@ -531,9 +533,9 @@ int main(int argc,char**argv){
     auto [raw_it,raw_inserted]=raw_user_cache.try_emplace(p.user,0U);
     if(raw_inserted){
       auto id=identity_lookup.find(p.user);
-      string person_name=id==identity_lookup.end()?string(p.user):string(id->second);
+      const string_view person_name=id==identity_lookup.end()?p.user:id->second;
       auto [person_it,inserted]=person_ids.try_emplace(person_name,static_cast<uint32_t>(people.size()));
-      if(inserted)people.push_back(std::move(person_name));
+      if(inserted)people.emplace_back(person_name);
       *raw_it=person_it->second;
     }
     uint32_t cat_id=0;
@@ -569,7 +571,7 @@ int main(int argc,char**argv){
   }
   for(auto &e:events)e.person=rank[e.person];
   vector<string>().swap(people);
-  unordered_map<string,uint32_t>().swap(person_ids);
+  unordered_map<string_view,uint32_t>().swap(person_ids);
   // Counting-distribute by canonical person (already assigned lexicographic
   // ranks), then sort timestamps only inside each person's contiguous span.
   // This avoids millions of cross-person comparisons in the global sort.
