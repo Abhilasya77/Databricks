@@ -665,8 +665,45 @@ int main(int argc,char**argv){
         PartOut &out=pouts[tid];
         native_parquet::UserDailyParquetWriter parquet(
           (fs::path(argv[6])/"user_daily"/("part-"+to_string(tid)+".parquet")).string());
-        unordered_map<string_view,uint32_t> local_pids;
-        vector<string_view> local_people;
+        // V66-2: Isolated flat open-addressing LocalPersonTable on V64 baseline.
+        struct LocalPersonTable {
+          vector<uint32_t> slots;
+          vector<uint64_t> hashes;
+          vector<string_view> people;
+          void reset(size_t expected){
+            size_t cap=256;
+            while(cap<expected*2)cap<<=1;
+            slots.assign(cap,0);
+            hashes.clear(); hashes.reserve(expected);
+            people.clear(); people.reserve(expected);
+          }
+          void rehash(size_t cap){
+            vector<uint32_t> next(cap,0);
+            const size_t mask=cap-1;
+            for(size_t i=0;i<people.size();++i){
+              size_t pos=(hashes[i]>>6)&mask;
+              while(next[pos])pos=(pos+1)&mask;
+              next[pos]=static_cast<uint32_t>(i+1);
+            }
+            slots.swap(next);
+          }
+          uint32_t intern(string_view s){
+            if((people.size()+1)*10>=slots.size()*7)rehash(slots.size()*2);
+            const uint64_t h=fast_hash_sv(s);
+            const size_t mask=slots.size()-1;
+            size_t pos=(h>>6)&mask;
+            while(uint32_t idx=slots[pos]){
+              const uint32_t id=idx-1;
+              if(hashes[id]==h && people[id]==s)return id;
+              pos=(pos+1)&mask;
+            }
+            const uint32_t id=static_cast<uint32_t>(people.size());
+            people.push_back(s);
+            hashes.push_back(h);
+            slots[pos]=id+1;
+            return id;
+          }
+        } lp_tbl;
         vector<Event> local_events;
         vector<Event> local_grouped;
         vector<size_t> local_ends;
@@ -677,21 +714,18 @@ int main(int argc,char**argv){
           size_t total_ev=0;
           for(size_t w=0;w<validation_threads;++w)total_ev+=person_buckets[w][part].size();
           if(total_ev==0)continue;
-          local_pids.clear();
-          local_people.clear();
+          lp_tbl.reset(total_ev/4+64);
           local_events.clear();
           local_events.reserve(total_ev);
-          local_pids.reserve(total_ev/4+64);
           for(size_t w=0;w<validation_threads;++w){
             auto &b=person_buckets[w][part];
             for(const PersonEvent &pe:b){
-              auto [it,ins]=local_pids.try_emplace(pe.person,static_cast<uint32_t>(local_people.size()));
-              if(ins)local_people.push_back(pe.person);
-              local_events.push_back(Event{pe.ts,pe.cents,it->second,pe.category,pe.purchase});
+              const uint32_t pid=lp_tbl.intern(pe.person);
+              local_events.push_back(Event{pe.ts,pe.cents,pid,pe.category,pe.purchase});
             }
             vector<PersonEvent>().swap(b);
           }
-          const size_t np=local_people.size();
+          const size_t np=lp_tbl.people.size();
           local_ends.assign(np+1,0);
           for(const Event &e:local_events)++local_ends[static_cast<size_t>(e.person)+1];
           for(size_t i=1;i<=np;++i)local_ends[i]+=local_ends[i-1];
@@ -732,7 +766,7 @@ int main(int argc,char**argv){
             if(to-from>1)
               sort(local_grouped.begin()+from,local_grouped.begin()+to,
                    [](const Event&a,const Event&b){return a.ts<b.ts;});
-            const string person_str(local_people[pid]);
+            const string person_str(lp_tbl.people[pid]);
             for(size_t k=from;k<to;++k){
               const Event &e=local_grouped[k];
               if(!have_session||e.person!=last_person||e.ts-prev>GAP_MS){
