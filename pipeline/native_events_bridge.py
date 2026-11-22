@@ -1,4 +1,4 @@
-"""Optional C++ event-processing backend for the Shopping Sessions pipeline.
+﻿"""Optional C++ event-processing backend for the Shopping Sessions pipeline.
 
 Companion to ../native_events.cpp. The interface returns the same Session and
 user_daily types as events_sessions.compute_events_sessions(), so our campaign
@@ -21,6 +21,23 @@ import tempfile
 from events_sessions import Session
 
 
+def _write_identity_bin(path: Path, identity_map: dict) -> None:
+    if not identity_map:
+        path.write_bytes(b'')
+        return
+    pack_u32 = struct.Struct('<I').pack
+    chunks = []
+    append = chunks.append
+    for src, dst in identity_map.items():
+        b_src = src.encode('utf-8')
+        b_dst = dst.encode('utf-8')
+        append(pack_u32(len(b_src)))
+        append(b_src)
+        append(pack_u32(len(b_dst)))
+        append(b_dst)
+    path.write_bytes(b''.join(chunks))
+
+
 def compute_events_sessions_native(data_dir, identity_map, scratch_dir=None):
     binary = os.environ.get('NATIVE_EVENTS_BINARY', '/app/native_events')
     binary_path = Path(binary)
@@ -31,12 +48,7 @@ def compute_events_sessions_native(data_dir, identity_map, scratch_dir=None):
     with tempfile.TemporaryDirectory(prefix='native_events_', dir=root) as temporary:
         folder = Path(temporary)
         ids = folder / 'identity.bin'
-        with ids.open('wb') as f:
-            for src, dst in identity_map.items():
-                for value in (src, dst):
-                    b = value.encode('utf-8')
-                    f.write(struct.pack('<I', len(b)))
-                    f.write(b)
+        _write_identity_bin(ids, identity_map)
         users_path = folder / 'users.jsonl'
         sessions_path = folder / 'sessions.jsonl'
         subprocess.run([str(binary_path), str(data_dir), str(ids),
@@ -61,13 +73,7 @@ def compute_events_sessions_native(data_dir, identity_map, scratch_dir=None):
 
 @contextmanager
 def native_event_files(data_dir, identity_map, scratch_dir=None):
-    """Run C++ and expose its session JSONL file directly to DuckDB.
-
-    Avoids constructing millions of Python Session objects and writing them
-    back to an intermediate JSONL file. The temporary files stay alive for
-    the entire `with` block and are removed even if the SQL stage fails.
-    `yield` returns (sessions_jsonl_path, user_daily_rows).
-    """
+    """Run C++ and expose its session JSONL file directly to DuckDB."""
     start = time.perf_counter()
     binary = os.environ.get('NATIVE_EVENTS_BINARY', '/app/native_events')
     if not Path(binary).is_file():
@@ -77,12 +83,7 @@ def native_event_files(data_dir, identity_map, scratch_dir=None):
     with tempfile.TemporaryDirectory(prefix='native_fast_', dir=root) as temporary:
         folder = Path(temporary)
         ids = folder / 'identity.bin'
-        with ids.open('wb') as f:
-            for src, dst in identity_map.items():
-                for value in (src, dst):
-                    encoded = value.encode('utf-8')
-                    f.write(struct.pack('<I', len(encoded)))
-                    f.write(encoded)
+        _write_identity_bin(ids, identity_map)
         users_path = folder / 'users.jsonl'
         sessions_path = folder / 'sessions.jsonl'
         campaigns_path = folder / 'campaigns.jsonl'
@@ -90,9 +91,6 @@ def native_event_files(data_dir, identity_map, scratch_dir=None):
         subprocess.run([str(binary), str(data_dir), str(ids),
                         str(users_path), str(sessions_path), str(campaigns_path)], check=True)
         native_done = time.perf_counter()
-        # The native engine already emitted correctly typed JSONL. Keep the
-        # files alive until the caller finishes its DuckDB COPY; avoid reading
-        # hundreds of thousands of rows into Python dictionaries.
         if os.environ.get('SHOPPING_PROFILE') == '1':
             print(f'PROFILE bridge_idmap_seconds={mapped-start:.3f}', file=sys.stderr)
             print(f'PROFILE native_engine_seconds={native_done-mapped:.3f}', file=sys.stderr)
