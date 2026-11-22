@@ -98,17 +98,57 @@ static bool parse_line(const string &line,size_t fields,vector<string> &out){
   }
   return out.size()==fields;
 }
+// Fast 64-bit hash for event IDs (inlined, 8-byte chunked + avalanche).
+static inline uint64_t fast_hash_sv(string_view s) noexcept {
+  const char *p = s.data();
+  size_t n = s.size();
+  uint64_t h = 0x9e3779b97f4a7c15ULL ^ (static_cast<uint64_t>(n) * 0xbf58476d1ce4e5b9ULL);
+  while (n >= 8) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    h ^= v;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    p += 8;
+    n -= 8;
+  }
+  uint64_t tail = 0;
+  if (n > 0) memcpy(&tail, p, n);
+  h ^= tail;
+  h ^= h >> 30;
+  h *= 0xbf58476d1ce4e5b9ULL;
+  h ^= h >> 27;
+  h *= 0x94d049bb133111ebULL;
+  h ^= h >> 31;
+  return h;
+}
+
 // Zero-allocation parser for event rows. Views remain valid while `line` lives.
 // The challenge dialect has no escaped quotes and no quoted commas.
 static bool parse_event_views(string_view line, array<string_view,7> &out){
   if(line.empty())return false;
+  const char *base=line.data();
+  const size_t len=line.size();
+  if(!memchr(base,'"',len)){
+    size_t begin=0;
+    for(size_t i=0;i<6;++i){
+      const void *comma=memchr(base+begin,',',len-begin);
+      if(!comma)return false;
+      const size_t end=static_cast<const char*>(comma)-base;
+      out[i]=string_view(base+begin,end-begin);
+      begin=end+1;
+    }
+    if(memchr(base+begin,',',len-begin))return false;
+    out[6]=string_view(base+begin,len-begin);
+    return true;
+  }
   size_t begin=0;
   for(size_t i=0;i<7;++i){
     size_t end=line.find(',',begin);
     if(i<6 && end==string::npos)return false;
     if(i==6 && end!=string::npos)return false;
-    if(end==string::npos)end=line.size();
-    string_view value(line.data()+begin,end-begin);
+    if(end==string::npos)end=len;
+    string_view value(base+begin,end-begin);
     if(value.find('"')!=string_view::npos){
       if(value.size()<2||value.front()!='"'||value.back()!='"'||
          value.find('"',1)!=value.size()-1)return false;
@@ -272,17 +312,26 @@ int main(int argc,char**argv){
     mappings.push_back(move(f));
   }
   constexpr size_t SHARD_COUNT=128;
+  // V53: tagged open-addressed table (32-bit hash tag + 32-bit index in uint64_t slot)
+  // rejects non-matching probes without touching entries[] or mmap'd CSV bytes.
+  struct Candidate {
+    string_view id;
+    Raw raw;
+    uint64_t hash_code;
+  };
   struct FlatRows {
-    struct Entry { string_view first; Raw second; size_t hash_code; };
+    struct Entry { string_view first; Raw second; uint64_t hash_code; };
     vector<Entry> entries;
-    vector<uint32_t> slots;
+    vector<uint64_t> slots;
     size_t size() const { return entries.size(); }
     void rehash_to(size_t capacity){
-      vector<uint32_t> next(capacity,0);
+      vector<uint64_t> next(capacity,0);
+      const size_t mask=capacity-1;
       for(size_t i=0;i<entries.size();++i){
-        size_t pos=(entries[i].hash_code>>7)&(capacity-1);
-        while(next[pos])pos=(pos+1)&(capacity-1);
-        next[pos]=static_cast<uint32_t>(i+1);
+        const uint64_t h=entries[i].hash_code;
+        size_t pos=(h>>7)&mask;
+        while(next[pos])pos=(pos+1)&mask;
+        next[pos]=(h&0xFFFFFFFF00000000ULL)|static_cast<uint64_t>(i+1);
       }
       slots.swap(next);
     }
@@ -292,19 +341,46 @@ int main(int argc,char**argv){
       while(capacity<n*2)capacity*=2;
       rehash_to(capacity);
     }
-    pair<Entry*,bool> try_emplace(string_view key,size_t hash_code){
+    void upsert_batch(const vector<Candidate> &batch){
       if(slots.empty())rehash_to(16);
-      if((entries.size()+1)*10>=slots.size()*7)rehash_to(slots.size()*2);
-      size_t pos=(hash_code>>7)&(slots.size()-1);
-      while(slots[pos]){
-        Entry &e=entries[slots[pos]-1];
-        if(e.hash_code==hash_code && e.first==key)return {&e,false};
-        pos=(pos+1)&(slots.size()-1);
+      size_t mask=slots.size()-1;
+      const size_t n=batch.size();
+      for(size_t i=0;i<n;++i){
+        if(i+8<n){
+          const size_t ppos=(batch[i+8].hash_code>>7)&mask;
+          __builtin_prefetch(&slots[ppos],1,1);
+        }
+        const Candidate &c=batch[i];
+        const uint64_t h=c.hash_code;
+        const uint64_t tag=h&0xFFFFFFFF00000000ULL;
+        size_t pos=(h>>7)&mask;
+        bool found=false;
+        while(uint64_t s=slots[pos]){
+          if((s&0xFFFFFFFF00000000ULL)==tag){
+            Entry &e=entries[static_cast<uint32_t>(s)-1];
+            if(e.first==c.id){
+              Raw &prev=e.second;
+              const string_view prev_ingest(prev.line.data()+prev.ingest_pos,prev.ingest_len);
+              const string_view cand_ingest(c.raw.line.data()+c.raw.ingest_pos,c.raw.ingest_len);
+              if(cand_ingest<prev_ingest)prev=c.raw;
+              found=true;
+              break;
+            }
+          }
+          pos=(pos+1)&mask;
+        }
+        if(!found){
+          if((entries.size()+1)*10>=slots.size()*7){
+            rehash_to(slots.size()*2);
+            mask=slots.size()-1;
+            pos=(h>>7)&mask;
+            while(slots[pos])pos=(pos+1)&mask;
+          }
+          if(entries.size()==UINT32_MAX)throw runtime_error("too many event IDs per shard");
+          entries.push_back(Entry{c.id,c.raw,h});
+          slots[pos]=tag|static_cast<uint64_t>(entries.size());
+        }
       }
-      if(entries.size()==UINT32_MAX)throw runtime_error("too many event IDs per shard");
-      entries.push_back(Entry{key,Raw{},hash_code});
-      slots[pos]=static_cast<uint32_t>(entries.size());
-      return {&entries.back(),true};
     }
     auto begin() const{return entries.begin();}
     auto end() const{return entries.end();}
@@ -318,11 +394,7 @@ int main(int argc,char**argv){
   // V40: buffer candidate rows by their destination shard. A worker obtains
   // one lock per populated shard per task instead of one lock per event.
   // Winner selection is order-independent: minimum lexicographic ingest value.
-  struct Candidate {
-    string_view id;
-    Raw raw;
-    size_t hash_code;
-  };
+
   // V47: reuse per-worker shard staging buffers across 8 MiB tasks.
   // Previously each task allocated and freed up to 128 vectors, even when
   // the same worker immediately processed another chunk. All staged views
@@ -355,7 +427,7 @@ int main(int argc,char**argv){
       if(parse_event_views(line,fields)&&!fields[0].empty()){
         const uint32_t ip=static_cast<uint32_t>(fields[3].data()-line.data());
         const uint32_t il=static_cast<uint32_t>(fields[3].size());
-        const size_t idhash=hash<string_view>{}(fields[0]);
+        const uint64_t idhash=fast_hash_sv(fields[0]);
         staged[idhash&(SHARD_COUNT-1)].push_back(Candidate{fields[0],Raw{line,ip,il},idhash});
       }
       start=stop+static_cast<size_t>(!!lf);
@@ -364,16 +436,9 @@ int main(int argc,char**argv){
       auto &batch=staged[shard_id];
       if(batch.empty())continue;
       Shard &shard=shards[shard_id];
-      lock_guard<mutex> guard(shard.lock);
-      for(const Candidate &c:batch){
-        auto [it,inserted]=shard.rows.try_emplace(c.id,c.hash_code);
-        if(inserted)it->second=c.raw;
-        else {
-          Raw &prev=it->second;
-          const string_view prev_ingest(prev.line.data()+prev.ingest_pos,prev.ingest_len);
-          const string_view candidate_ingest(c.raw.line.data()+c.raw.ingest_pos,c.raw.ingest_len);
-          if(candidate_ingest<prev_ingest)prev=c.raw;
-        }
+      {
+        lock_guard<mutex> guard(shard.lock);
+        shard.rows.upsert_batch(batch);
       }
       batch.clear(); // retain capacity for this worker's next task
     }
